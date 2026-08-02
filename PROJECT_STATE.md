@@ -123,6 +123,23 @@ reviews RECON.md against the gate checklist.
   knobs at create/connect; unset leaves tuning empty; tri-state
   --use-batch-delete via kopia's BoolListVar idiom; 4 tests -race green.
 
+### Post-completion additions (user-requested, 2026-08-02)
+- **WP-6** — CPU metrics (rclone-subprocess accounting via /proc
+  boundary reads + reconciliation residual + broken-accounting
+  tripwire), graph subcommand (dataviz-guided SVGs), fresh
+  native-vs-rclone-cpu comparison run. Status: IN FLIGHT.
+- **WP-7** — native folder creation: DONE, merged 4b2ad623.
+  --create-folder-name at repository create; idempotent reuse;
+  ambiguous-duplicates error; resolved ID persisted into config/tokens
+  + printed with connect hint. Live + CLI e2e verified w/ cleanup.
+  LIVE FINDING: under drive.file even files.get("root") 404s (alias
+  writable, not readable). Un-defers the non-Picker half of the WP-5
+  EM decision (1); Picker flow remains the follow-up for hand-created
+  folders.
+- LOCAL_TESTING.md rewritten rclone-free (per-machine repo layout
+  recommended for client machines; cross-user drive.file sharing
+  explicitly steered away from pending live testing).
+
 ## PROJECT COMPLETE 2026-08-02
 
 All six phase gates passed. Upstream branch: gdrive-native-upstream,
