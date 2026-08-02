@@ -124,10 +124,22 @@ reviews RECON.md against the gate checklist.
   --use-batch-delete via kopia's BoolListVar idiom; 4 tests -race green.
 
 ### Post-completion additions (user-requested, 2026-08-02)
-- **WP-6** — CPU metrics (rclone-subprocess accounting via /proc
-  boundary reads + reconciliation residual + broken-accounting
-  tripwire), graph subcommand (dataviz-guided SVGs), fresh
-  native-vs-rclone-cpu comparison run. Status: IN FLIGHT.
+- **WP-6** — CPU metrics + graphs + refreshed comparison: DONE, merged
+  b4038c47. CPU attribution = /proc cumulative-counter boundary reads of
+  live descendant tree, reconciled vs rusage per-process (residual
+  3.7-5.9% published; tripwire never fired; agent caught+fixed a real
+  double-count via negative residuals). Refreshed 5-trial comparison
+  (native-vs-rclone-cpu, supersedes initial): every CPU row REAL,
+  native 3.2x cheaper CPU e2e (9.4s vs 29.8s), wall unchanged 2.3x;
+  delete-sweep wall degraded to WEAK this run (one 4.3s native trial;
+  p50 still REAL +16.6%, CPU REAL +69%); :warm ≡ :hot confirmed,
+  erratum closed. Note: most of rclone-lane extra CPU is kopia's WebDAV
+  client, not rclone itself. 5 SVG graphs published (split linear
+  panels, dataviz-validated palette). Baseline check informational:
+  exit 0, no REAL regression; baseline deliberately untouched.
+- Upstream branch REFRESHED: gdrive-native-upstream @ 03290d1e (amended
+  single commit, now includes WP-7 folder creation; byte-identical to
+  work branch for upstream paths; builds green).
 - **WP-7** — native folder creation: DONE, merged 4b2ad623.
   --create-folder-name at repository create; idempotent reuse;
   ambiguous-duplicates error; resolved ID persisted into config/tokens
