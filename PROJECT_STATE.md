@@ -5,8 +5,22 @@
 
 ## Current Phase
 
-**Phase 4 — Tuning loop** (starting 2026-08-02; PREREQUISITE: journal
-replay defect below)
+**Phase 5 — Upstream preparation** (starting 2026-08-02)
+
+Phase 4 GATE PASSED 2026-08-02 (9caf1c7c): TUNING.md (agent-followable
+loop, four adoption conditions, REAL-only rule) + gdrive-tuned.json
+(defaults w/ provenance) in repo; TUNING_LOG.md + run artifacts in
+$KOPIA_GDRIVE_BENCH_RESULTS. Cycle 1 (pacerMinSleepMS 100→50) = REJECT,
+zero REAL rows, pre-registered mechanism: token bucket (10/s, burst 100)
+never binds at suite scale — all suite draws are sequential and slower
+than refill. Baseline correctly untouched. Cost 57.6min / 5MB / 227.5k QU.
+Cycle-1 change requests → WP-4b (dispatched): (1) compare reference is
+alphabetical not config-order (delta-sign inversion hazard for automated
+agents); (2) pacer steady-state waits uninstrumented (add paced-wait
+counter so pacer hypotheses are falsifiable); (3) delete-sweep size not
+flag-settable + harness --parallelism masks tuning.deleteParallelism.
+
+**Phase 4 — Tuning loop** (COMPLETE)
 
 Phase 3 GATE PASSED 2026-08-02: WP-3b merged 339ffd7d; curated artifacts in
 tools/gdrive-bench/results/ (report .md + compare .json +
@@ -18,13 +32,13 @@ read-metadata hot 4.6x; range-read 3.7x; list-heavy steady-state ~3x
 (the 36x median is inflated by rclone shard-dir accumulation — honest
 note in report); delete-sweep +25%; small-write +65%; pack-write +59%.
 
-OPEN DEFECT (pre-Phase-4 blocker): persistent fileID journal contributes
-NOTHING across reconnect — read-metadata :warm ≈ :cold (9.29 vs 9.08s),
-both 50x files.list, zero files.get, while :hot = 50x files.get at 1/20th
-the QU. Entries verified present on disk → journal REPLAY at open (or
-namespace/offset bug) suspected. Also known: pending-batch flush timing at
-Close, registry refcount interplay. Investigate + fix before tuning
-(read-metadata results are meaningless until the cache works as designed).
+DEFECT CLOSED 2026-08-02 (3239593a): backend was INNOCENT — the harness
+warm-pass recycle called FlushCaches (contractual full wipe, truncates
+journal) before reopening, measuring cold twice. "Journal replay broken"
+hypothesis DISPROVEN: replay, RescanTail, Close-flush, registry all
+correct. Harness fixed; regression tests pin the contract both ways;
+live re-run: :warm ≡ :hot (files.get, 250 QU) vs :cold (files.list,
+5000 QU). Erratum appended to published report. Phase 4 UNBLOCKED.
 
 PHASE 4 HYPOTHESIS BACKLOG (from comparison data):
 1. small-write 1.21s/blob: PutBlob pays files.list (100 QU) per new blob
@@ -82,10 +96,42 @@ reviews RECON.md against the gate checklist.
 | 1 Error taxonomy | taxonomy merged, unit tests green, covers all reasons from RECON | PASSED 2026-08-01 (commit 861eabe1) |
 | 2 Backend rewrite | provider suite green (mock) + validate-provider clean vs real Drive + e2e snapshot cycle | PASSED 2026-08-01 (62f35a2d) |
 | 3 Benchmark framework | one interleaved native-vs-rclone report promoted to curated results | PASSED 2026-08-02 (339ffd7d) |
-| 4 Tuning loop | TUNING.md + one documented cycle in TUNING_LOG.md | not started |
+| 4 Tuning loop | TUNING.md + one documented cycle in TUNING_LOG.md | PASSED 2026-08-02 (9caf1c7c) |
 | 5 Upstream prep | PR branch, docs, changelog ready | not started |
 
 ## Work Packages
+
+### Phase 5 (dispatched 2026-08-02)
+- **WP-5** — upstream prep: user docs rewrite (three auth modes, limits,
+  tuning), de-"[Not maintained]", PR_DESCRIPTION.md w/ verified issue
+  states + before/after evidence, changelog-mechanism investigation,
+  CLA/DCO audit, upstream commit/rebase plan (fork-only files listed,
+  plan written not executed). Status: DONE 2026-08-02, merged a733e16e.
+  Audit findings: NO manual changelog (git-chglog generates from commit
+  subjects — PR title with `providers` scope IS the changelog entry); NO
+  CLA/DCO; upstream guidelines recommend a `design` issue for large work
+  and REQUIRE squash-to-one-commit after review. EM decisions on flagged
+  items: (1) folder auto-create under drive.file (PHASE2_DESIGN Contract
+  4 clause) NOT implemented by 2c — ACCEPTED as documented follow-up
+  (Google Picker trigger_onepick, RECON §C.6); docs honestly describe
+  actual behavior + --scope=drive workaround. (2) StatsFromStorage/
+  TransportStatsSnapshot exported without in-tree consumer once harness
+  is filtered from upstream PR — KEEP exported, flagged for reviewers in
+  PR_DESCRIPTION. (3) blanket "experimental" wording removed in favor of
+  specific validation statements — ACCEPTED.
+- **WP-5b** — tuning knobs as CLI flags (mission gap found at Phase-5
+  review: JSON-only today). Status: DISPATCHED
+
+### Phase 4 (dispatched 2026-08-02)
+- **WP-4** — TUNING.md + gdrive-tuned.json + cycle 1 (pacer MinSleep):
+  DONE, merged 9caf1c7c. Cycle 1 REJECT (zero REAL rows, pre-registered
+  mechanism). TUNING_LOG.md live in $KOPIA_GDRIVE_BENCH_RESULTS.
+- **WP-4b** — cycle-1 change requests: DONE, merged 0dad0b7d.
+  compare reference = config order + --reference override;
+  RecordPacedWait → paced_wait_ms per workload (pacer hypotheses now
+  falsifiable by measurement); --delete-sweep-n +
+  tuning.deleteParallelism honored w/ effective value in result params.
+  220 tests green -race; SCHEMA.md +77/-0 additive.
 
 ### Phase 3 (dispatched 2026-08-01)
 - **WP-3a** — tools/gdrive-bench harness: 6 workloads, ABBA interleaving,
