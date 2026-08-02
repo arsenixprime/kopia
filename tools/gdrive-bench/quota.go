@@ -60,6 +60,11 @@ func quotaUnitCost(method string) int64 {
 const (
 	quotaSourceObserved = "observed" // counted from the Drive API calls the transport saw.
 	quotaSourceNone     = "none"     // the backend is not Drive-instrumented, so it spends no Drive quota.
+
+	// quotaSourceEstimated is what the out-of-process workload reports: the
+	// Drive traffic happens in a child process, where this harness's transport
+	// counters cannot see it, so the figure is derived from the bytes moved.
+	quotaSourceEstimated = "estimated"
 )
 
 // quotaUnitsOfSnapshot totals the quota units of a transport delta.

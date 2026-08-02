@@ -161,14 +161,14 @@ func TestEstimateRunCountsOnlyRemoteTargets(t *testing.T) {
 	p := smokeParams()
 	wls := allWorkloads()
 
-	require.Equal(t, workloadEstimate{}, estimateRun(wls, p, fsTarget, 3))
+	require.Equal(t, workloadEstimate{}, estimateRun(wls, &p, fsTarget, 3))
 
-	remote := estimateRun(wls, p, driveTarget, 3)
+	remote := estimateRun(wls, &p, driveTarget, 3)
 	require.Positive(t, remote.UploadBytes)
 	require.Positive(t, remote.QuotaUnits)
 
 	// The estimate scales with the number of trials.
-	one := estimateRun(wls, p, driveTarget, 1)
+	one := estimateRun(wls, &p, driveTarget, 1)
 	require.Equal(t, one.UploadBytes*3, remote.UploadBytes)
 }
 

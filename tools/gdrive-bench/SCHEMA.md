@@ -346,3 +346,106 @@ cron/CI hook.
 `run` writes its result document even when a workload fails, so a failed run is
 still diagnosable; `--keep-going` continues past a failing workload and still
 exits 1 at the end.
+
+---
+
+## 8. Additive notes (post-freeze)
+
+Everything below was added after `schema_version: 1` was frozen. All of it is
+additive under the rules at the top of this document: new optional fields, new
+workload names, new result keys and one new value of an existing enumeration.
+A reader written against §1–§7 still reads these documents correctly; it will
+simply not know what the new keys mean. **The version stays 1.**
+
+### 8.1 New workload: `snapshot-e2e` (opt-in)
+
+Not part of the default suite - `--workloads` has to name it, and it needs a
+kopia binary (`--kopia-exe`, or the harness builds one from the current work
+tree and records the path in `config.kopia_exe`).
+
+It measures **kopia**, not `blob.Storage`: a real repository is created in the
+target's own folder, a synthetic source tree is backed up, mutated and backed up
+again, verified in full and then compacted. Five result keys, one kopia
+invocation each, timed by the harness around the process:
+
+| Key | Command |
+|---|---|
+| `snapshot-e2e:create` | `repository create <provider> …` |
+| `snapshot-e2e:init` | `snapshot create <tree>` |
+| `snapshot-e2e:incremental` | `snapshot create <tree>` after the mutation |
+| `snapshot-e2e:verify` | `snapshot verify --verify-files-percent=100` |
+| `snapshot-e2e:maintenance` | `maintenance run --full --safety=none` |
+
+`--safety=none` is deliberate: full safety refuses to touch blobs younger than
+its retention margins, and every blob in a repository created seconds earlier is
+younger than that, so the default would measure a no-op.
+
+Reading its metrics:
+
+- `ops` is 1 and the four latency percentiles are all the stage's wall clock -
+  one invocation is one sample. Compare these rows on `wall_clock_ms`;
+  `ops_per_sec` is meaningless here.
+- `transport_delta` is **always null**, even for the native Drive target: the
+  API counters live in the child process. The API-call profile of the native
+  backend comes from the in-process workloads.
+- `bytes_up` / `bytes_down` are the **size of the source tree**, not a byte
+  counter - deduplication and compression make the real transfer smaller, which
+  is the safe direction for the quota ledger.
+- The workload requires the target folder to hold no `kopia.repository` blob and
+  fails fast if it does. Cleanup deletes exactly the blobs that appeared while
+  it ran (a before/after listing difference), because kopia's blob names are its
+  own and cannot be namespaced by the harness.
+
+### 8.2 New value of `quota_units_source`: `"estimated"`
+
+§3 lists `"observed"` and `"none"`. `snapshot-e2e` on a remote target reports
+`"estimated"`: the Drive traffic happens in a child process where the harness's
+transport cannot see it, so `quota_units` is derived from the bytes moved on the
+same assumptions the pre-run estimate uses. `"none"` keeps its meaning - the
+backend spends no Drive quota at all.
+
+### 8.3 New result key `read-metadata:warm`, and what `:cold` now means
+
+`--true-cold` changes the read-metadata workload from two passes to three:
+
+| Key | State |
+|---|---|
+| `read-metadata:hot` | the connection that wrote the blobs; every file ID in memory |
+| `read-metadata:warm` | fresh connection, in-memory map gone, **on-disk journal intact** |
+| `read-metadata:cold` | fresh connection **and a deleted journal**: every name resolved against Drive again |
+
+Without `--true-cold` the workload behaves exactly as §3 describes and produces
+`:hot` and `:cold` only, where `:cold` is the half-cold state that `:warm` names
+above.
+
+**This is a semantics change to an existing key, and it is deliberately not
+version-bumping** because the flag that causes it is recorded next to the number:
+`config.params.true_cold` says which of the two meanings a document's
+`read-metadata:cold` carries, and two results are only ever comparable when
+their `config.params` agree (§2). A reader that ignores `true_cold` and compares
+a true-cold `:cold` against a half-cold one is making the same mistake as one
+that compares different `read_metadata_n` values.
+
+The purge is surgical: only `<config.tuning.cacheDir>/gdrive-fileids` is
+removed. `--true-cold` **refuses to start** unless every native Drive target
+sets `config.tuning.cacheDir` to a directory the harness owns, so a benchmark
+can never delete the cache of a real repository.
+
+### 8.4 New fields
+
+`config.params` (all optional; zero values mean the workload was not selected or
+the default applies):
+
+| Field | Meaning |
+|---|---|
+| `snapshot_files` | files in the snapshot-e2e source tree (default 800, smoke 40) |
+| `snapshot_dirs` | top-level directories it is spread over (default 8, smoke 3) |
+| `snapshot_total_bytes` | total size of the tree (default 150 MiB, smoke 6 MiB) |
+| `snapshot_mutate_percent` | share of files deleted and re-added between the two snapshots (default 5; a further 2% of the survivors are appended to) |
+| `true_cold` | §8.3 |
+
+`config`:
+
+| Field | Meaning |
+|---|---|
+| `kopia_exe` | the binary `snapshot-e2e` drove; omitted when the workload did not run |

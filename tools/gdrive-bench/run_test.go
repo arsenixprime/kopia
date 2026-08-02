@@ -69,7 +69,12 @@ func TestTrialOrderRandomIsAPermutationAndVaries(t *testing.T) {
 func TestSelectWorkloads(t *testing.T) {
 	all, err := selectWorkloads("")
 	require.NoError(t, err)
-	require.Len(t, all, len(allWorkloads()))
+	require.Len(t, all, len(defaultWorkloads()))
+	require.NotContains(t, defaultWorkloadNames(), snapshotE2EName, "the opt-in workload must stay out of the default suite")
+
+	optIn, err := selectWorkloads(snapshotE2EName)
+	require.NoError(t, err)
+	require.Len(t, optIn, 1)
 
 	some, err := selectWorkloads("small-write, delete-sweep")
 	require.NoError(t, err)
@@ -183,7 +188,7 @@ func TestSmokeRunAgainstTwoFilesystemTargets(t *testing.T) {
 	// Every workload reported, no errors, and no Drive stats for a filesystem
 	// backend.
 	for _, tr := range res.Trials {
-		require.Len(t, tr.Workloads, len(allWorkloads())+expectedExtraPhases)
+		require.Len(t, tr.Workloads, len(defaultWorkloads())+expectedExtraPhases)
 
 		for key, m := range tr.Workloads {
 			require.Zero(t, m.Errors, key)

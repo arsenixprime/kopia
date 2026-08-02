@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/binary"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"sync"
@@ -38,6 +40,19 @@ type benchParams struct {
 	DeleteSweepN      int   `json:"delete_sweep_n"`
 	DeletePercent     int   `json:"delete_percent"`
 	Parallelism       int   `json:"parallelism"`
+
+	// SnapshotFiles, SnapshotDirs, SnapshotBytes and SnapshotMutatePercent size
+	// the synthetic source tree of the out-of-process snapshot-e2e workload.
+	SnapshotFiles         int   `json:"snapshot_files"`
+	SnapshotDirs          int   `json:"snapshot_dirs"`
+	SnapshotBytes         int64 `json:"snapshot_total_bytes"`
+	SnapshotMutatePercent int   `json:"snapshot_mutate_percent"`
+
+	// TrueCold makes the cold pass of read-metadata delete the on-disk file-ID
+	// journal before it reopens the storage, instead of only dropping the
+	// in-memory map. It changes what "read-metadata:cold" means, which is why it
+	// lives in the params: two results are only comparable when it agrees.
+	TrueCold bool `json:"true_cold"`
 }
 
 // Default workload sizes.
@@ -59,6 +74,11 @@ const (
 	defaultDeleteSweepN      = 100
 	defaultDeletePercent     = 50
 	defaultParallelism       = 8
+
+	defaultSnapshotFiles         = 800
+	defaultSnapshotDirs          = 8
+	defaultSnapshotMB            = 150
+	defaultSnapshotMutatePercent = 5
 )
 
 // Smoke-mode workload sizes. pack-write deliberately keeps the full 20 MB
@@ -75,6 +95,9 @@ const (
 	smokeListTraversals    = 2
 	smokeListBlobsN        = 5
 	smokeDeleteSweepN      = 10
+	smokeSnapshotFiles     = 40
+	smokeSnapshotDirs      = 3
+	smokeSnapshotMB        = 6
 )
 
 // defaultParams returns the full-size workload parameters.
@@ -96,6 +119,11 @@ func defaultParams() benchParams {
 		DeleteSweepN:      defaultDeleteSweepN,
 		DeletePercent:     defaultDeletePercent,
 		Parallelism:       defaultParallelism,
+
+		SnapshotFiles:         defaultSnapshotFiles,
+		SnapshotDirs:          defaultSnapshotDirs,
+		SnapshotBytes:         defaultSnapshotMB * mib,
+		SnapshotMutatePercent: defaultSnapshotMutatePercent,
 	}
 }
 
@@ -112,6 +140,9 @@ func smokeParams() benchParams {
 	p.ListTraversals = smokeListTraversals
 	p.ListBlobsN = smokeListBlobsN
 	p.DeleteSweepN = smokeDeleteSweepN
+	p.SnapshotFiles = smokeSnapshotFiles
+	p.SnapshotDirs = smokeSnapshotDirs
+	p.SnapshotBytes = smokeSnapshotMB * mib
 
 	return p
 }
@@ -145,8 +176,14 @@ type workloadDef struct {
 	// Doc is the one-line description printed by "run --help" and "knobs".
 	Doc string
 
+	// OptIn keeps a workload out of the default suite: it still runs when
+	// --workloads names it, but "everything" does not include it. snapshot-e2e
+	// is opt-in because it drives a separate kopia binary, which a plumbing
+	// smoke run has no business building.
+	OptIn bool
+
 	// Estimate predicts the cost of one execution, for the quota guard.
-	Estimate func(p benchParams) workloadEstimate
+	Estimate func(p *benchParams) workloadEstimate
 
 	// Run performs setup, measurement and (through the runner's deferred
 	// cleanup) teardown of one execution.
@@ -192,7 +229,28 @@ func allWorkloads() []workloadDef {
 			Estimate: estimateDeleteSweep,
 			Run:      runDeleteSweep,
 		},
+		{
+			Name:     snapshotE2EName,
+			Doc:      "the real kopia binary: repository create, initial snapshot, incremental, verify, full maintenance (opt-in, needs --kopia-exe)",
+			OptIn:    true,
+			Estimate: estimateSnapshotE2E,
+			Run:      runSnapshotE2E,
+		},
 	}
+}
+
+// defaultWorkloads is what "--workloads" selects when it is not given: every
+// registered workload that is not opt-in.
+func defaultWorkloads() []workloadDef {
+	out := []workloadDef{}
+
+	for _, w := range allWorkloads() {
+		if !w.OptIn {
+			out = append(out, w)
+		}
+	}
+
+	return out
 }
 
 // workloadByName looks a workload up in the registry.
@@ -217,6 +275,17 @@ func workloadNames() []string {
 	return out
 }
 
+// defaultWorkloadNames returns the names of the default suite.
+func defaultWorkloadNames() []string {
+	out := []string{}
+
+	for _, w := range defaultWorkloads() {
+		out = append(out, w.Name)
+	}
+
+	return out
+}
+
 // workloadEnv is what a workload gets to work with.
 type workloadEnv struct {
 	params benchParams
@@ -231,6 +300,18 @@ type workloadEnv struct {
 
 	open func(ctx context.Context) (blob.Storage, error)
 	cur  blob.Storage
+
+	// tgt is the target under measurement. Only the out-of-process workload
+	// needs it: it builds a kopia command line out of the connection.
+	tgt target
+
+	// cacheDir is the target's harness-owned local cache directory, or "" when
+	// the target has no purgeable on-disk cache. recycleCold empties the file-ID
+	// journal underneath it.
+	cacheDir string
+
+	// kopiaExe is the kopia binary the out-of-process workload drives.
+	kopiaExe string
 }
 
 // storage returns the connection the workload is currently using.
@@ -239,28 +320,87 @@ func (e *workloadEnv) storage() blob.Storage {
 }
 
 // recycle flushes and closes the current connection and opens a fresh one. It
-// is how the cold-cache pass drops the backend's in-memory state.
+// is how the WARM pass drops the backend's in-memory state.
 //
 // This is honest only up to a point, and only for the native backend: the
 // process-wide file-ID cache is refcounted, so dropping the last reference does
 // discard the in-memory map, but the on-disk journal survives - as it does in
-// production, where deleting it would measure a state a real user never has. A
-// truly cold cache needs a fresh process, which is what WP-3b's out-of-process
-// workload provides. For every other backend the two passes differ only in HTTP
-// connection reuse.
+// production, where a process restart still finds the journal. recycleCold is
+// the genuinely cold variant.
 func (e *workloadEnv) recycle(ctx context.Context) error {
-	if e.cur != nil {
-		if err := e.cur.FlushCaches(ctx); err != nil {
-			return errors.Wrap(err, "unable to flush the storage caches")
-		}
-
-		if err := e.cur.Close(ctx); err != nil {
-			return errors.Wrap(err, "unable to close the storage")
-		}
-
-		e.cur = nil
+	if err := e.closeCurrent(ctx); err != nil {
+		return err
 	}
 
+	return e.openNew(ctx)
+}
+
+// recycleCold is recycle plus the deletion of the on-disk file-ID journal, so
+// the reopened connection has to resolve every blob name against Drive again.
+// It is what a first-ever run on a new machine experiences.
+//
+// The journal is only deleted underneath the target's own configured cache
+// directory, which the harness requires to be one it owns (see
+// validateTrueCold): a bench run must never be able to delete the cache of a
+// real repository.
+func (e *workloadEnv) recycleCold(ctx context.Context) error {
+	if err := e.closeCurrent(ctx); err != nil {
+		return err
+	}
+
+	if err := purgeFileIDJournal(e.cacheDir); err != nil {
+		return err
+	}
+
+	return e.openNew(ctx)
+}
+
+// gdriveFileIDCacheSubdir is the directory the native backend keeps its
+// blobID-to-fileID journal in, relative to Options.Tuning.CacheDir. It is an
+// unexported constant over in repo/blob/gdrive; the name is duplicated here
+// deliberately, so that purging a cache never depends on unexported state - and
+// so that a rename over there leaves this harness purging nothing rather than
+// deleting something else. TestPurgeFileIDJournal pins the layout.
+const gdriveFileIDCacheSubdir = "gdrive-fileids"
+
+// purgeFileIDJournal removes the file-ID journal tree under a cache directory.
+// An empty cacheDir means the target has no purgeable on-disk cache (every
+// backend that is not the native Drive one), where a cold pass can only ever be
+// a fresh HTTP connection.
+func purgeFileIDJournal(cacheDir string) error {
+	if cacheDir == "" {
+		return nil
+	}
+
+	dir := filepath.Join(cacheDir, gdriveFileIDCacheSubdir)
+	if err := os.RemoveAll(dir); err != nil {
+		return errors.Wrapf(err, "unable to purge the file ID journal at %v", dir)
+	}
+
+	return nil
+}
+
+// closeCurrent flushes and drops the current connection.
+func (e *workloadEnv) closeCurrent(ctx context.Context) error {
+	if e.cur == nil {
+		return nil
+	}
+
+	if err := e.cur.FlushCaches(ctx); err != nil {
+		return errors.Wrap(err, "unable to flush the storage caches")
+	}
+
+	if err := e.cur.Close(ctx); err != nil {
+		return errors.Wrap(err, "unable to close the storage")
+	}
+
+	e.cur = nil
+
+	return nil
+}
+
+// openNew opens a fresh connection to the target.
+func (e *workloadEnv) openNew(ctx context.Context) error {
 	st, err := e.open(ctx)
 	if err != nil {
 		return err
@@ -358,7 +498,7 @@ func workloadOfKey(key string) string {
 // 1. small-write
 // ---------------------------------------------------------------------------
 
-func estimateSmallWrite(p benchParams) workloadEstimate {
+func estimateSmallWrite(p *benchParams) workloadEstimate {
 	avg := int64(p.SmallBlobMinBytes+p.SmallBlobMaxBytes) / 2 //nolint:mnd // arithmetic mean of the two bounds.
 
 	return workloadEstimate{
@@ -396,7 +536,7 @@ func runSmallWrite(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) 
 // 2. pack-write
 // ---------------------------------------------------------------------------
 
-func estimatePackWrite(p benchParams) workloadEstimate {
+func estimatePackWrite(p *benchParams) workloadEstimate {
 	return workloadEstimate{
 		UploadBytes: int64(p.PackWriteM) * p.PackSizeBytes,
 		QuotaUnits:  int64(p.PackWriteM)*quWrite(p.PackSizeBytes) + quCleanup(p.PackWriteM),
@@ -426,8 +566,11 @@ func runPackWrite(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 // 3. read-metadata
 // ---------------------------------------------------------------------------
 
-func estimateReadMetadata(p benchParams) workloadEstimate {
-	const passes = 2
+func estimateReadMetadata(p *benchParams) workloadEstimate {
+	passes := int64(metadataPasses)
+	if p.TrueCold {
+		passes = trueColdMetadataPasses
+	}
 
 	avg := int64(p.SmallBlobMinBytes+p.SmallBlobMaxBytes) / 2 //nolint:mnd // arithmetic mean of the two bounds.
 
@@ -439,6 +582,23 @@ func estimateReadMetadata(p benchParams) workloadEstimate {
 	}
 }
 
+// Phase names of read-metadata, and how many passes each mode makes.
+const (
+	phaseHot  = "hot"
+	phaseWarm = "warm"
+	phaseCold = "cold"
+
+	metadataPasses         = 2
+	trueColdMetadataPasses = 3
+)
+
+// runReadMetadata reads the metadata of a written set two or three times.
+//
+//	hot  - the connection that wrote the blobs, every file ID in memory.
+//	warm - a fresh connection, in-memory map gone, on-disk journal intact
+//	       (only produced with --true-cold; without it this state IS ":cold").
+//	cold - with --true-cold, a fresh connection AND a deleted journal: every
+//	       blob name has to be resolved against Drive again.
 func runReadMetadata(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 	ids, err := e.writeSet(ctx, "rm", e.params.ReadMetadataN, func(int) int64 {
 		return int64(e.params.SmallBlobMinBytes)
@@ -447,21 +607,38 @@ func runReadMetadata(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error
 		return nil, err
 	}
 
+	out := []phaseMetrics{}
+
 	hot, hotErr := metadataPass(ctx, e.storage(), ids)
+	out = append(out, phaseMetrics{Key: phaseKey("read-metadata", phaseHot), Metrics: hot})
+
 	if hotErr != nil {
-		return one(phaseKey("read-metadata", "hot"), hot), hotErr
+		return out, hotErr
 	}
 
-	if err := e.recycle(ctx); err != nil {
-		return one(phaseKey("read-metadata", "hot"), hot), err
+	if e.params.TrueCold {
+		if err := e.recycle(ctx); err != nil {
+			return out, err
+		}
+
+		warm, warmErr := metadataPass(ctx, e.storage(), ids)
+		out = append(out, phaseMetrics{Key: phaseKey("read-metadata", phaseWarm), Metrics: warm})
+
+		if warmErr != nil {
+			return out, warmErr
+		}
+
+		if err := e.recycleCold(ctx); err != nil {
+			return out, err
+		}
+	} else if err := e.recycle(ctx); err != nil {
+		return out, err
 	}
 
 	cold, coldErr := metadataPass(ctx, e.storage(), ids)
+	out = append(out, phaseMetrics{Key: phaseKey("read-metadata", phaseCold), Metrics: cold})
 
-	return []phaseMetrics{
-		{Key: phaseKey("read-metadata", "hot"), Metrics: hot},
-		{Key: phaseKey("read-metadata", "cold"), Metrics: cold},
-	}, coldErr
+	return out, coldErr
 }
 
 // metadataPass reads the metadata of every blob in ids once.
@@ -482,7 +659,7 @@ func metadataPass(ctx context.Context, st blob.Storage, ids []blob.ID) (Workload
 // 4. range-read
 // ---------------------------------------------------------------------------
 
-func estimateRangeRead(p benchParams) workloadEstimate {
+func estimateRangeRead(p *benchParams) workloadEstimate {
 	return workloadEstimate{
 		UploadBytes: int64(p.RangeReadPacks) * p.RangeReadPackSize,
 		QuotaUnits: int64(p.RangeReadPacks)*quWrite(p.RangeReadPackSize) +
@@ -539,7 +716,7 @@ func runRangeRead(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 // 5. list-heavy
 // ---------------------------------------------------------------------------
 
-func estimateListHeavy(p benchParams) workloadEstimate {
+func estimateListHeavy(p *benchParams) workloadEstimate {
 	const phases = 2
 
 	return workloadEstimate{
@@ -594,7 +771,7 @@ func listPass(ctx context.Context, st blob.Storage, prefix blob.ID, count int) (
 // 6. delete-sweep
 // ---------------------------------------------------------------------------
 
-func estimateDeleteSweep(p benchParams) workloadEstimate {
+func estimateDeleteSweep(p *benchParams) workloadEstimate {
 	return workloadEstimate{
 		UploadBytes: int64(p.DeleteSweepN) * int64(p.SmallBlobMinBytes),
 		QuotaUnits: int64(p.DeleteSweepN)*quWrite(int64(p.SmallBlobMinBytes)) +

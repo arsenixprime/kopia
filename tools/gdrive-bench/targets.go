@@ -13,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/blob/gdrive"
 )
 
 // target is one backend the suite runs against.
@@ -318,6 +319,44 @@ func configViews(expanded any) (knobs, redacted map[string]any) {
 	redacted = redactTree(cfg).(map[string]any)
 
 	return knobs, redacted
+}
+
+// fileIDCacheDir returns the local cache directory a native Drive target keeps
+// its blobID-to-fileID journal under, and whether the target has one at all.
+//
+// It reads the decoded connection config rather than the raw JSON, so a
+// misspelled key cannot silently produce a cache directory the harness believes
+// it owns.
+func (t target) fileIDCacheDir() (dir string, isDriveTarget bool) {
+	o, ok := t.Conn.Config.(*gdrive.Options)
+	if !ok {
+		return "", false
+	}
+
+	return o.Tuning.CacheDir, true
+}
+
+// validateTrueCold refuses a true-cold run whose Drive targets do not name a
+// cache directory of their own.
+//
+// The cold pass deletes that directory's file-ID journal. Deleting the platform
+// default would throw away the cache of every repository on the machine, so the
+// harness insists the operator points the target at a directory that exists to
+// be deleted.
+func validateTrueCold(targets []target) error {
+	for _, t := range targets {
+		dir, isDrive := t.fileIDCacheDir()
+		if !isDrive {
+			continue
+		}
+
+		if dir == "" {
+			return errors.Errorf("target %q is a native Drive target and --true-cold deletes the file ID journal, "+
+				"so it must set config.tuning.cacheDir to a directory the harness owns (the platform default is shared with real repositories)", t.Name)
+		}
+	}
+
+	return nil
 }
 
 // openStorage connects to a target. isCreate is passed through to the provider,

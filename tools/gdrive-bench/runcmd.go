@@ -60,6 +60,10 @@ type runOptions struct {
 	smallWriteN    int
 	parallelism    int
 	harnessCommit  string
+	trueCold       bool
+	kopiaExe       string
+	snapshotFiles  int
+	snapshotMB     int64
 	explicitlySet  map[string]bool
 }
 
@@ -68,7 +72,7 @@ func cmdRun(ctx context.Context, args []string, out, errOut io.Writer) int {
 	o := runOptions{}
 
 	fs.StringVar(&o.targetsFile, "targets", "", "path to the targets JSON file (an array of {name, connection}); omit with --smoke for a temp-dir filesystem target")
-	fs.StringVar(&o.workloads, "workloads", "", "comma-separated workloads to run (default: all of "+strings.Join(workloadNames(), ",")+")")
+	fs.StringVar(&o.workloads, "workloads", "", "comma-separated workloads to run (default: "+strings.Join(defaultWorkloadNames(), ",")+"; also available, opt-in: "+snapshotE2EName+")")
 	fs.IntVar(&o.trials, "trials", defaultTrials, "number of trials of the whole suite per target")
 	fs.StringVar(&o.order, "order", orderABBA, "trial ordering: abba (default), random, or sequential (debugging only - it cannot separate a slow backend from a slow minute)")
 	fs.DurationVar(&o.cooldown, "cooldown", defaultCooldown, "pause between consecutive target executions")
@@ -82,6 +86,10 @@ func cmdRun(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs.IntVar(&o.smallWriteN, "small-write-n", 0, "number of small-write blobs (default: 100, smoke: 10)")
 	fs.IntVar(&o.parallelism, "parallelism", 0, "bounded parallelism of delete-sweep and cleanup (default: 8)")
 	fs.StringVar(&o.harnessCommit, "harness-commit", "", "override the recorded harness commit (default: git rev-parse HEAD)")
+	fs.BoolVar(&o.trueCold, "true-cold", false, "make read-metadata:cold genuinely cold by deleting the on-disk file ID journal between passes (adds a read-metadata:warm phase; requires every Drive target to set config.tuning.cacheDir)")
+	fs.StringVar(&o.kopiaExe, "kopia-exe", "", "kopia binary the snapshot-e2e workload drives (default: build one from the current work tree)")
+	fs.IntVar(&o.snapshotFiles, "snapshot-files", 0, "number of files in the snapshot-e2e source tree (default: 800, smoke: 40)")
+	fs.Int64Var(&o.snapshotMB, "snapshot-mb", 0, "total size of the snapshot-e2e source tree in MB (default: 150, smoke: 6)")
 
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -117,6 +125,19 @@ func doRun(ctx context.Context, o *runOptions, out io.Writer) (int, error) {
 		return exitRefused, err
 	}
 
+	if cfg.Params.TrueCold {
+		if err := validateTrueCold(targets); err != nil {
+			return exitRefused, err
+		}
+	}
+
+	cleanupExe, err := resolveKopiaExe(ctx, o, wls, &cfg, out)
+	if err != nil {
+		return exitRefused, err
+	}
+
+	defer cleanupExe()
+
 	resultsDir, err := resolveResultsDir(ctx, o.resultsDir)
 	if err != nil {
 		return exitRefused, err
@@ -129,7 +150,7 @@ func doRun(ctx context.Context, o *runOptions, out io.Writer) (int, error) {
 		return exitRefused, err
 	}
 
-	est := estimateRun(wls, cfg.Params, targets, cfg.Trials)
+	est := estimateRun(wls, &cfg.Params, targets, cfg.Trials)
 	decision := checkQuota(ledger, nowUTC(), est.UploadBytes, est.QuotaUnits, o.uploadFraction)
 	res.Quota.Decision = decision
 	res.Quota.LedgerPath = filepath.Join(resultsDir, ledgerFileName)
@@ -199,6 +220,16 @@ func resolveRunConfig(o *runOptions) (RunConfig, error) {
 		params.Parallelism = o.parallelism
 	}
 
+	if o.snapshotFiles > 0 {
+		params.SnapshotFiles = o.snapshotFiles
+	}
+
+	if o.snapshotMB > 0 {
+		params.SnapshotBytes = o.snapshotMB * mib
+	}
+
+	params.TrueCold = o.trueCold
+
 	if trials < 1 {
 		return RunConfig{}, errors.Errorf("--trials must be at least 1, got %v", trials)
 	}
@@ -249,10 +280,71 @@ func resolveTargets(o *runOptions) ([]target, func(), error) {
 	return t, func() { os.RemoveAll(dir) }, nil //nolint:errcheck // best-effort cleanup of our own temp dir.
 }
 
+// resolveKopiaExe makes a kopia binary available when the out-of-process
+// workload was selected, building one from the current work tree when the
+// operator did not name one. The returned function removes anything it built.
+func resolveKopiaExe(ctx context.Context, o *runOptions, wls []workloadDef, cfg *RunConfig, out io.Writer) (func(), error) {
+	noop := func() {}
+
+	if !needsKopiaExe(wls) {
+		return noop, nil
+	}
+
+	if o.kopiaExe != "" {
+		abs, err := filepath.Abs(o.kopiaExe)
+		if err != nil {
+			return noop, errors.Wrapf(err, "unable to resolve --kopia-exe %v", o.kopiaExe)
+		}
+
+		if _, err := os.Stat(abs); err != nil {
+			return noop, errors.Wrapf(err, "unable to use --kopia-exe %v", abs)
+		}
+
+		cfg.KopiaExe = abs
+
+		return noop, nil
+	}
+
+	dir, err := os.MkdirTemp("", "gdrive-bench-kopia-")
+	if err != nil {
+		return noop, errors.Wrap(err, "unable to create the build directory for kopia")
+	}
+
+	cleanup := func() { os.RemoveAll(dir) } //nolint:errcheck // best-effort cleanup of our own temp dir.
+
+	outf(out, "building kopia for the %v workload (pass --kopia-exe to skip)\n", snapshotE2EName)
+
+	bctx, cancel := context.WithTimeout(ctx, buildTimeout)
+	defer cancel()
+
+	exe, err := buildKopia(bctx, dir)
+	if err != nil {
+		cleanup()
+
+		return noop, err
+	}
+
+	cfg.KopiaExe = exe
+
+	return cleanup, nil
+}
+
+// needsKopiaExe reports whether the selected workloads include one that drives
+// the kopia binary.
+func needsKopiaExe(wls []workloadDef) bool {
+	for _, w := range wls {
+		if w.Name == snapshotE2EName {
+			return true
+		}
+	}
+
+	return false
+}
+
 // selectWorkloads resolves the --workloads list.
 func selectWorkloads(csv string) ([]workloadDef, error) {
 	if csv == "" {
-		return allWorkloads(), nil
+		return defaultWorkloads(), nil
 	}
 
 	out := []workloadDef{}
@@ -429,14 +521,19 @@ func runSuite(ctx context.Context, t target, wls []workloadDef, cfg *RunConfig, 
 // runOneWorkload opens a connection for one workload, runs it, and always
 // cleans up after it.
 func runOneWorkload(ctx context.Context, t target, w workloadDef, cfg *RunConfig, trial int) (phases []phaseMetrics, soft []string, err error) {
+	cacheDir, _ := t.fileIDCacheDir()
+
 	env := &workloadEnv{
-		params: cfg.Params,
-		prefix: blob.ID(fmt.Sprintf("bench-%v-t%v-%v-", runIDOf(ctx), trial, w.Name)),
-		rnd:    mathrand.New(mathrand.NewPCG(uint64(cfg.Seed), workloadSalt(w.Name, trial))), //nolint:gosec // reproducible benchmark data, not security.
-		open:   t.openStorage,
+		params:   cfg.Params,
+		prefix:   blob.ID(fmt.Sprintf("bench-%v-t%v-%v-", runIDOf(ctx), trial, w.Name)),
+		rnd:      mathrand.New(mathrand.NewPCG(uint64(cfg.Seed), workloadSalt(w.Name, trial))), //nolint:gosec // reproducible benchmark data, not security.
+		open:     t.openStorage,
+		tgt:      t,
+		cacheDir: cacheDir,
+		kopiaExe: cfg.KopiaExe,
 	}
 
-	if err := env.recycle(ctx); err != nil {
+	if err := env.openNew(ctx); err != nil {
 		return nil, nil, err
 	}
 
@@ -495,7 +592,7 @@ func summarizePhases(phases []phaseMetrics, err error) string {
 
 // estimateRun predicts what a whole run will upload and spend, counting only
 // the targets whose traffic actually leaves the machine.
-func estimateRun(wls []workloadDef, p benchParams, targets []target, trials int) workloadEstimate {
+func estimateRun(wls []workloadDef, p *benchParams, targets []target, trials int) workloadEstimate {
 	var per workloadEstimate
 
 	for _, w := range wls {

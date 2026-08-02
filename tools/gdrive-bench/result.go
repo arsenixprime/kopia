@@ -63,6 +63,11 @@ type RunConfig struct {
 	Workloads   []string    `json:"workloads"`
 	TargetsFile string      `json:"targets_file"`
 	Params      benchParams `json:"params"`
+
+	// KopiaExe is the binary the out-of-process snapshot-e2e workload drove,
+	// empty when that workload did not run. When the harness built it on
+	// demand, it is the code of harness.commit.
+	KopiaExe string `json:"kopia_exe,omitempty"`
 }
 
 // TargetInfo describes one measured backend.

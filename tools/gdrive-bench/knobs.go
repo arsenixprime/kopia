@@ -164,6 +164,13 @@ func harnessKnobs() []KnobInfo {
 		mk("small-write-n", "int", "100 (smoke: 10)", "10..1000", "Number of small blobs written by small-write.", []string{"small-write"}),
 		mk("parallelism", "int", "8", "1..64", "Bounded parallelism of delete-sweep and of every workload's cleanup.", []string{"delete-sweep"}),
 		mk("daily-upload-fraction", "float64", "0.5", "0.01..1.0", "Fraction of Google's 750 GB/day/user upload cap the harness may spend in one UTC day before it refuses to start.", nil),
+		mk("true-cold", "bool", "false", "true|false",
+			"Delete the on-disk file ID journal between the warm and the cold metadata pass, so read-metadata:cold measures a machine that has "+
+				"never seen the folder. Adds read-metadata:warm and requires every Drive target to set tuning.cacheDir.",
+			[]string{"read-metadata"}),
+		mk("kopia-exe", "string", "built from the work tree", "a path", "The kopia binary snapshot-e2e drives. Leave it unset to measure the code the result's harness.commit names.", []string{snapshotE2EName}),
+		mk("snapshot-files", "int", "800 (smoke: 40)", "50..10000", "Files in the snapshot-e2e source tree. Together with snapshot-mb it decides whether the workload measures per-file overhead or upload throughput.", []string{snapshotE2EName}),
+		mk("snapshot-mb", "int64", "150 (smoke: 6)", "10..2000 MB", "Total size of the snapshot-e2e source tree.", []string{snapshotE2EName}),
 	}
 }
 
