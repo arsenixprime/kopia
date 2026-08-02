@@ -868,6 +868,88 @@ func TestGdriveStorageMockJournalTailRescan(t *testing.T) {
 	require.Equal(t, fileID, cached)
 }
 
+// TestGdriveStorageMockReopenKeepsTheFileIDCacheWarm pins the property the
+// benchmark harness's WARM pass exists to measure, and which a real process
+// restart depends on: closing the last connection to a folder and opening a new
+// one against the same cache directory must resolve blobs out of the on-disk
+// journal - one files.get each - instead of re-querying every name.
+func TestGdriveStorageMockReopenKeepsTheFileIDCacheWarm(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d := newFakeDrive(t)
+	cacheDir := testutil.TempDirectory(t)
+
+	first, err := New(ctx, d.options(t, cacheDir), false)
+	require.NoError(t, err)
+
+	ids := []blob.ID{"warm-a", "warm-b", "warm-c"}
+	for _, id := range ids {
+		require.NoError(t, first.PutBlob(ctx, id, gather.FromSlice([]byte(id)), blob.PutOptions{}))
+	}
+
+	// Dropping the last reference discards the in-memory map and flushes the
+	// pending batch; the journal survives, as it does across a process restart.
+	require.NoError(t, first.Close(ctx))
+
+	second, err := New(ctx, d.options(t, cacheDir), false)
+	require.NoError(t, err)
+
+	defer second.Close(ctx) //nolint:errcheck
+
+	require.NotSame(t, mustGdriveStorage(t, first).idCache, mustGdriveStorage(t, second).idCache,
+		"the reopened connection must not be sharing the closed connection's cache instance")
+
+	listsBefore := d.requestCount(methodFilesList)
+	getsBefore := d.requestCount(methodFilesGet)
+
+	for _, id := range ids {
+		bm, err := second.GetMetadata(ctx, id)
+		require.NoError(t, err)
+		require.Equal(t, int64(len(id)), bm.Length)
+	}
+
+	require.Equal(t, 0, d.requestCount(methodFilesList)-listsBefore,
+		"a reopen with the journal intact must not cost a name query")
+	require.Equal(t, len(ids), d.requestCount(methodFilesGet)-getsBefore,
+		"every blob should have been read by cached file ID")
+}
+
+// TestGdriveStorageMockFlushCachesMakesAReopenCold is the other half of the
+// contract, and the mechanism behind the harness defect this test pair was
+// written for: FlushCaches is a full wipe, in memory AND on disk, so a
+// connection opened after one starts from nothing and pays a name query per
+// blob. Anything that wants a warm reopen must therefore not call it.
+func TestGdriveStorageMockFlushCachesMakesAReopenCold(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d := newFakeDrive(t)
+	cacheDir := testutil.TempDirectory(t)
+
+	first, err := New(ctx, d.options(t, cacheDir), false)
+	require.NoError(t, err)
+
+	ids := []blob.ID{"cold-a", "cold-b", "cold-c"}
+	for _, id := range ids {
+		require.NoError(t, first.PutBlob(ctx, id, gather.FromSlice([]byte(id)), blob.PutOptions{}))
+	}
+
+	require.NoError(t, first.FlushCaches(ctx))
+	require.NoError(t, first.Close(ctx))
+
+	second, err := New(ctx, d.options(t, cacheDir), false)
+	require.NoError(t, err)
+
+	defer second.Close(ctx) //nolint:errcheck
+
+	listsBefore := d.requestCount(methodFilesList)
+
+	for _, id := range ids {
+		_, err := second.GetMetadata(ctx, id)
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, len(ids), d.requestCount(methodFilesList)-listsBefore,
+		"a wiped journal must cost one name query per blob")
+}
+
 // appendJournalRecord writes one blobID->fileID record onto the end of a file ID
 // journal exactly as a second Kopia process would.
 func appendJournalRecord(t *testing.T, journalPath string, blobID blob.ID, fileID string) {

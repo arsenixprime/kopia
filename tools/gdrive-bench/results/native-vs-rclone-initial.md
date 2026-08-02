@@ -212,3 +212,17 @@ magnitude, not the third digit.
 
 The raw run result and the per-trial dumps stay in `$KOPIA_GDRIVE_BENCH_RESULTS`
 and are deliberately not committed.
+
+---
+
+## Erratum (2026-08-02)
+
+The `read-metadata:warm` rows in this report are invalid: the harness's
+warm-pass recycle called `FlushCaches` (contractually a full cache wipe,
+which truncates the on-disk fileID journal) before reopening, so ":warm"
+actually measured a second cold pass. The conclusion "the on-disk journal
+contributes nothing across a reconnect" is therefore wrong — after fixing
+the harness (commit following this report), a live re-run shows :warm
+indistinguishable from :hot (files.get-dominated, 250 QU vs 5000 QU for 50
+blobs; p50 137ms vs 176ms). The :hot, :cold, and all other rows stand.
+Native-vs-rclone comparisons are unaffected (both lanes ran the same flow).

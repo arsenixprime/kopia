@@ -319,16 +319,31 @@ func (e *workloadEnv) storage() blob.Storage {
 	return e.cur
 }
 
-// recycle flushes and closes the current connection and opens a fresh one. It
-// is how the WARM pass drops the backend's in-memory state.
+// recycle closes the current connection and opens a fresh one, WITHOUT asking
+// the backend to drop anything. It is how the WARM pass drops the backend's
+// in-memory state and only that.
 //
 // This is honest only up to a point, and only for the native backend: the
 // process-wide file-ID cache is refcounted, so dropping the last reference does
 // discard the in-memory map, but the on-disk journal survives - as it does in
-// production, where a process restart still finds the journal. recycleCold is
-// the genuinely cold variant.
+// production, where a process restart still finds the journal. recycleFlushed
+// and recycleCold are the cold variants.
 func (e *workloadEnv) recycle(ctx context.Context) error {
-	if err := e.closeCurrent(ctx); err != nil {
+	if err := e.closeCurrent(ctx, false); err != nil {
+		return err
+	}
+
+	return e.openNew(ctx)
+}
+
+// recycleFlushed is recycle plus a FlushCaches, which the blob.Storage contract
+// defines as a full wipe of the backend's local caches - for the native Drive
+// backend, the persisted file-ID journal as well as the in-memory map. It is how
+// the cold pass of a run WITHOUT --true-cold is made cold: there is no
+// harness-owned cache directory to delete in that mode, so the backend has to be
+// asked to forget by itself.
+func (e *workloadEnv) recycleFlushed(ctx context.Context) error {
+	if err := e.closeCurrent(ctx, true); err != nil {
 		return err
 	}
 
@@ -344,7 +359,7 @@ func (e *workloadEnv) recycle(ctx context.Context) error {
 // validateTrueCold): a bench run must never be able to delete the cache of a
 // real repository.
 func (e *workloadEnv) recycleCold(ctx context.Context) error {
-	if err := e.closeCurrent(ctx); err != nil {
+	if err := e.closeCurrent(ctx, true); err != nil {
 		return err
 	}
 
@@ -380,14 +395,21 @@ func purgeFileIDJournal(cacheDir string) error {
 	return nil
 }
 
-// closeCurrent flushes and drops the current connection.
-func (e *workloadEnv) closeCurrent(ctx context.Context) error {
+// closeCurrent drops the current connection. dropCaches first asks the backend
+// to discard its local caches, which blob.Storage.FlushCaches defines as a full
+// wipe: the native Drive backend deletes its persisted file-ID journal there, so
+// a connection opened afterwards starts from nothing. Only a pass that wants to
+// be cold may ask for it - the warm pass exists precisely to measure the reopen
+// that still finds the journal.
+func (e *workloadEnv) closeCurrent(ctx context.Context, dropCaches bool) error {
 	if e.cur == nil {
 		return nil
 	}
 
-	if err := e.cur.FlushCaches(ctx); err != nil {
-		return errors.Wrap(err, "unable to flush the storage caches")
+	if dropCaches {
+		if err := e.cur.FlushCaches(ctx); err != nil {
+			return errors.Wrap(err, "unable to flush the storage caches")
+		}
 	}
 
 	if err := e.cur.Close(ctx); err != nil {
@@ -595,10 +617,11 @@ const (
 // runReadMetadata reads the metadata of a written set two or three times.
 //
 //	hot  - the connection that wrote the blobs, every file ID in memory.
-//	warm - a fresh connection, in-memory map gone, on-disk journal intact
-//	       (only produced with --true-cold; without it this state IS ":cold").
-//	cold - with --true-cold, a fresh connection AND a deleted journal: every
-//	       blob name has to be resolved against Drive again.
+//	warm - a fresh connection, in-memory map gone, on-disk journal intact: what
+//	       a restarted process finds. Only produced with --true-cold.
+//	cold - a fresh connection that knows nothing, so every blob name has to be
+//	       resolved against Drive again: with --true-cold the journal is deleted
+//	       from under it, without it the backend is asked to wipe its own caches.
 func runReadMetadata(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 	ids, err := e.writeSet(ctx, "rm", e.params.ReadMetadataN, func(int) int64 {
 		return int64(e.params.SmallBlobMinBytes)
@@ -631,7 +654,7 @@ func runReadMetadata(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error
 		if err := e.recycleCold(ctx); err != nil {
 			return out, err
 		}
-	} else if err := e.recycle(ctx); err != nil {
+	} else if err := e.recycleFlushed(ctx); err != nil {
 		return out, err
 	}
 

@@ -87,6 +87,73 @@ func TestRecycleColdPurgesTheJournalBetweenPasses(t *testing.T) {
 	require.NoError(t, e.storage().Close(ctx))
 }
 
+// fileIDCacheStorage is a blob.Storage whose FlushCaches behaves the way the
+// native Drive backend's does: per the blob.Storage contract it is a full wipe,
+// so it discards the on-disk file-ID journal as well as any in-memory map. It is
+// what makes the difference between the warm and the cold pass observable in a
+// test with no Drive in it.
+type fileIDCacheStorage struct {
+	blob.Storage
+
+	cacheDir string
+	flushes  *int
+}
+
+func (s fileIDCacheStorage) FlushCaches(_ context.Context) error {
+	*s.flushes++
+
+	return purgeFileIDJournal(s.cacheDir)
+}
+
+// TestRecycleKeepsTheOnDiskFileIDJournal is the regression test for the warm
+// pass measuring nothing: recycle used to ask the backend to flush its caches
+// before closing it, which for the native backend deletes the journal, so the
+// reopened connection was as cold as the cold pass and the two phases were
+// indistinguishable. The warm pass must drop the connection and nothing else.
+func TestRecycleKeepsTheOnDiskFileIDJournal(t *testing.T) {
+	ctx := context.Background()
+
+	storageDir := t.TempDir()
+	cacheDir := t.TempDir()
+	journalDir := plantJournal(t, cacheDir)
+
+	flushes := 0
+
+	e := &workloadEnv{
+		params:   smokeParams(),
+		cacheDir: cacheDir,
+		open: func(ctx context.Context) (blob.Storage, error) {
+			st, err := filesystem.New(ctx, &filesystem.Options{Path: storageDir}, true)
+			if err != nil {
+				return nil, err //nolint:wrapcheck // test seam.
+			}
+
+			return fileIDCacheStorage{Storage: st, cacheDir: cacheDir, flushes: &flushes}, nil
+		},
+	}
+
+	require.NoError(t, e.openNew(ctx))
+
+	// WARM: a fresh connection, with the journal still where a restarted process
+	// would find it.
+	require.NoError(t, e.recycle(ctx))
+	require.Zero(t, flushes, "the warm pass must not ask the backend to drop its caches")
+	require.DirExists(t, journalDir, "the warm pass must leave the on-disk file ID journal alone")
+
+	// COLD without --true-cold: no directory to purge, so the wipe is the only
+	// thing that makes the pass cold, and it still has to happen.
+	require.NoError(t, e.recycleFlushed(ctx))
+	require.Equal(t, 1, flushes)
+	require.NoDirExists(t, journalDir)
+
+	// COLD with --true-cold: the harness deletes the journal itself.
+	plantJournal(t, cacheDir)
+	require.NoError(t, e.recycleCold(ctx))
+	require.NoDirExists(t, journalDir)
+
+	require.NoError(t, e.storage().Close(ctx))
+}
+
 func TestValidateTrueColdRequiresAHarnessOwnedCacheDir(t *testing.T) {
 	bare, err := parseTargets([]byte(`[{"name":"native","connection":{"type":"gdrive","config":{"folderID":"F"}}}]`), lookupMap(nil))
 	require.NoError(t, err)
