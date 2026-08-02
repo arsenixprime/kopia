@@ -5,7 +5,41 @@
 
 ## Current Phase
 
-**Phase 3 — Benchmark & comparison framework** (started 2026-08-01)
+**Phase 4 — Tuning loop** (starting 2026-08-02; PREREQUISITE: journal
+replay defect below)
+
+Phase 3 GATE PASSED 2026-08-02: WP-3b merged 339ffd7d; curated artifacts in
+tools/gdrive-bench/results/ (report .md + compare .json +
+recommended-baseline.json); raw run + baseline in
+$KOPIA_GDRIVE_BENCH_RESULTS (20260802T052322Z-native-vs-rclone-initial).
+5 ABBA trials, 2h46m, 2.71GB up, 231.5k QU, zero errors/retries.
+HEADLINE: native wins EVERY REAL timing row; e2e 184s vs 422s (2.3x);
+read-metadata hot 4.6x; range-read 3.7x; list-heavy steady-state ~3x
+(the 36x median is inflated by rclone shard-dir accumulation — honest
+note in report); delete-sweep +25%; small-write +65%; pack-write +59%.
+
+OPEN DEFECT (pre-Phase-4 blocker): persistent fileID journal contributes
+NOTHING across reconnect — read-metadata :warm ≈ :cold (9.29 vs 9.08s),
+both 50x files.list, zero files.get, while :hot = 50x files.get at 1/20th
+the QU. Entries verified present on disk → journal REPLAY at open (or
+namespace/offset bug) suspected. Also known: pending-batch flush timing at
+Close, registry refcount interplay. Investigate + fix before tuning
+(read-metadata results are meaningless until the cache works as designed).
+
+PHASE 4 HYPOTHESIS BACKLOG (from comparison data):
+1. small-write 1.21s/blob: PutBlob pays files.list (100 QU) per new blob
+   for exists-check. Ideas: skip pre-resolve when DoNotRecreate absent??
+   (semantics!), cheaper existence probe (fields=files(id) pageSize=1
+   already?), pacer min-sleep sweep, write parallelism at kopia layer.
+2. pacer MinSleep 100ms may be conservative for dedicated client (WP-2e
+   relaxed-pacer delete data: 19.5→23 blobs/s).
+3. DeleteParallelism sweep (8 default).
+4. ListPageSize + fields already tight; list is latency-bound.
+5. UploadChunkSize × pack-size grid for pack-write.
+6. rclone residue: shard dirs undeletable under drive.file
+   (appNotAuthorizedToChild) — purge rclone lane before each run.
+
+**Phase 3 — Benchmark & comparison framework** (COMPLETE)
 
 Phase 2 GATE PASSED 2026-08-01 (EM-run, real Drive, kopia binary built from
 62f35a2d): `kopia repository validate-provider` → "All good." in 56s incl.
@@ -47,11 +81,27 @@ reviews RECON.md against the gate checklist.
 | 0 Recon | RECON.md complete w/ file:line refs + doc URLs | PASSED 2026-08-01 |
 | 1 Error taxonomy | taxonomy merged, unit tests green, covers all reasons from RECON | PASSED 2026-08-01 (commit 861eabe1) |
 | 2 Backend rewrite | provider suite green (mock) + validate-provider clean vs real Drive + e2e snapshot cycle | PASSED 2026-08-01 (62f35a2d) |
-| 3 Benchmark framework | one interleaved native-vs-rclone report promoted to curated results | not started |
+| 3 Benchmark framework | one interleaved native-vs-rclone report promoted to curated results | PASSED 2026-08-02 (339ffd7d) |
 | 4 Tuning loop | TUNING.md + one documented cycle in TUNING_LOG.md | not started |
 | 5 Upstream prep | PR branch, docs, changelog ready | not started |
 
 ## Work Packages
+
+### Phase 3 (dispatched 2026-08-01)
+- **WP-3a** — tools/gdrive-bench harness: 6 workloads, ABBA interleaving,
+  SCHEMA.md v1 (frozen), compare w/ REAL/WEAK/NOISE, baseline check,
+  knobs reflection, publish, quota ledger. Status: DONE 2026-08-02,
+  EM-verified, merged 36fb2b7d. Live smoke vs real Drive green (62s,
+  3825 QU, cleanup verified). Accepted deviations: tool build-tagged
+  !no_extra_providers w/ stub main; multi-phase result keys
+  (read-metadata:hot/:cold, list-heavy:full/:prefixed); cold pass keeps
+  on-disk journal (true-cold → WP-3b); knob defaults hand-maintained
+  with staleness-failing test.
+- **WP-3b** — snapshot-e2e workload (real kopia binary, 4 timed stages),
+  true-cold cache purge, and THE gate artifact: first full interleaved
+  native-vs-rclone comparison on real Drive, published to
+  tools/gdrive-bench/results/. Status: DISPATCHED (long-running: the
+  comparison itself is 1.5-3h of live benchmarking)
 
 ### Phase 2 wave 1 (dispatched 2026-08-01)
 - **WP-PACER** — repo/blob/gdrive/gdrivepacer/: adaptive rate limiter per
@@ -228,12 +278,18 @@ Formal interleaved baselines land in $KOPIA_GDRIVE_BENCH_RESULTS (Phase 3).
 
 ## Phase 3 environment notes
 
-- rclone NOT installed, no remotes (checked 2026-08-01). No user action
-  needed: synthesize rclone.conf from the authorized_user token (client_id/
-  client_secret/refresh_token) + scope drive.file + root_folder_id; fetch
-  rclone binary into scratchpad/tools. KOPIA_GDRIVE_TEST_FOLDER_RCLONE is
-  hand-created → INVISIBLE to our drive.file token; rclone side must use an
-  app-created folder instead (same pattern as the native side).
+- rclone lane READY (EM-prepared 2026-08-01): rclone v1.75.0 at
+  scratchpad/tools/rclone; remote `gdrive-bench` in ~/.config/rclone/
+  rclone.conf (0600, synthesized from the authorized_user token — same
+  OAuth client + user as native = controlled comparison); app-created
+  folder kopia-gdrive-bench-rclone = 1Q-VRL4RZAikrHI8uyHIA4lv6QiTbczfT
+  (also in gdrive.env as KOPIA_GDRIVE_BENCH_FOLDER_RCLONE; pass to rclone
+  via --drive-root-folder-id or root_folder_id). RW verified (rcat/ls/
+  delete). Legacy KOPIA_GDRIVE_TEST_FOLDER_RCLONE (hand-created, invisible
+  to drive.file) left in env but unused.
+- kopia rclone backend invocation: kopia repository create rclone
+  --remote-path gdrive-bench:<sub> --rclone-exe scratchpad/tools/rclone
+  (kopia runs `rclone serve webdav` internally).
 - Phase 4 note: the "our client vs rclone shared client" quota experiment
   requires an interactive rclone OAuth consent (browser) for rclone's
   baked-in client — needs user action when we get there, or drop that
