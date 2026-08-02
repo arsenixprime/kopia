@@ -487,8 +487,8 @@ func trialOrder(order string, n, trial int, rnd *mathrand.Rand) []int {
 }
 
 // runSuite runs every selected workload once against one target.
-func runSuite(ctx context.Context, t target, wls []workloadDef, cfg *RunConfig, trial, seq, pos int, out io.Writer) (TrialResult, []string, error) {
-	tr := TrialResult{
+func runSuite(ctx context.Context, t target, wls []workloadDef, cfg *RunConfig, trial, seq, pos int, out io.Writer) (tr TrialResult, soft []string, err error) {
+	tr = TrialResult{
 		Trial:          trial,
 		Sequence:       seq,
 		Position:       pos,
@@ -498,26 +498,39 @@ func runSuite(ctx context.Context, t target, wls []workloadDef, cfg *RunConfig, 
 		ErrorsByReason: map[string]int64{},
 	}
 
-	var soft []string
+	var attributed float64
+
+	// The trial window has to close after the last workload's deferred cleanup,
+	// so that every connection is shut down and every child reaped inside it -
+	// that is what makes cpu_residual_ms an audit rather than an artifact.
+	cpu := startTrialCPUMeter()
+
+	defer func() {
+		if total, ok := cpu.stop(); ok {
+			tr.CPUTotalMS = durationMS(total.total())
+			tr.CPUResidualMS = tr.CPUTotalMS - attributed
+		}
+	}()
 
 	for _, w := range wls {
 		outf(out, "[trial %v/%v] %v %v ... ", trial+1, cfg.Trials, t.Name, w.Name)
 
-		phases, softErrs, err := runOneWorkload(ctx, t, w, cfg, trial)
+		phases, softErrs, werr := runOneWorkload(ctx, t, w, cfg, trial)
 		soft = append(soft, softErrs...)
 
 		for i := range phases {
 			tr.Workloads[phases[i].Key] = phases[i].Metrics
+			attributed += phases[i].Metrics.CPUTotalMS
 
 			if phases[i].Metrics.Transport != nil {
 				mergeErrorsByReason(tr.ErrorsByReason, phases[i].Metrics.Transport.ErrorsByReason)
 			}
 		}
 
-		outln(out, summarizePhases(phases, err))
+		outln(out, summarizePhases(phases, werr))
 
-		if err != nil {
-			return tr, soft, errors.Wrapf(err, "workload %v on target %v (trial %v)", w.Name, t.Name, trial+1)
+		if werr != nil {
+			return tr, soft, errors.Wrapf(werr, "workload %v on target %v (trial %v)", w.Name, t.Name, trial+1)
 		}
 	}
 

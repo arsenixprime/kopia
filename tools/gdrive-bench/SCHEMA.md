@@ -526,3 +526,164 @@ path, `pacedWaits`/`pacedWaitMS` are the error-free one.
 
   `params` is omitted entirely by workloads that resolve nothing, so its absence
   means "`config.params` is the whole story".
+
+### 8.8 CPU accounting
+
+Wall clock is half of what a backup backend costs. The other half is CPU, and
+measuring it across these two lanes is not symmetric: the native Drive backend
+runs **inside** the harness process, while the rclone lane's work happens in an
+`rclone serve webdav` child that Kopia's rclone backend spawns — and inside
+`snapshot-e2e`, in an rclone *grandchild* that the child kopia spawned. Only one
+number is comparable between them:
+
+> **`cpu_total_ms` = the CPU this phase cost the machine** — the harness process
+> plus every descendant of it, user + system.
+
+**Fairness, stated in both directions.** On the native lane `cpu_total_ms` is
+essentially all harness CPU, because the backend *is* the harness. On the rclone
+lane it is the harness (Kopia's WebDAV client) **plus** the rclone subprocess.
+Neither column is "the backend's CPU" on its own; the **sum is the comparable
+number**, and it is the sum that both lanes report.
+
+Workload metrics (§3) gain:
+
+| Field | Meaning |
+|---|---|
+| `cpu_user_ms` | float; the harness process's own user CPU during the phase — `getrusage(RUSAGE_SELF)` delta |
+| `cpu_sys_ms` | float; the same for system CPU |
+| `cpu_children_user_ms` | float; user CPU of every **descendant** process attributed to the phase (see the attribution rules below) |
+| `cpu_children_sys_ms` | float; the same for system CPU |
+| `cpu_total_ms` | float; the sum of the four. **The headline metric.** |
+| `cpu_pct` | float; `cpu_total_ms / wall_clock_ms × 100`. `100` is one core saturated for the whole phase; more than 100 means more than one core was busy |
+| `cpu_source` | string; which accounting produced the numbers: `"rusage"`, `"proc"`, `"wait4"`, `+`-joined in that order, or `"none"` where the platform has none |
+
+#### How descendants are attributed
+
+Three sources contribute. They are estimates of the **same** quantity, so they
+are reconciled — never summed naively.
+
+1. **`rusage`** — `RUSAGE_SELF` and `RUSAGE_CHILDREN` deltas across the phase.
+   `RUSAGE_CHILDREN` only moves when a direct child is **reaped**, and Kopia's
+   rclone backend reaps its `rclone serve webdav` at storage `Close` — which
+   happens at a connection recycle or in the runner's deferred cleanup, i.e.
+   **outside** every measured window and once per *workload* rather than once per
+   *phase*. Reap-time accounting alone would therefore report ~0 CPU for every
+   rclone phase and dump a whole connection's CPU into whichever window happened
+   to contain a `Close`. It is not the authority; it is exact for a child whose
+   whole life falls inside one phase.
+2. **`proc`** (Linux) — `/proc/<pid>/stat` `utime`+`stime` are **cumulative**
+   counters. The harness reads them for every live descendant at both phase
+   boundaries, and the difference *is* that phase's descendant CPU, with no
+   sampling error. A background poll every 200 ms is a catch-net only: it exists
+   so that a descendant which **exits mid-phase** still contributes what it burned
+   up to its last observation. Each process's own `utime`+`stime` are counted and
+   its `cutime`/`cstime` deliberately are not — every descendant is visited in its
+   own right, so adding a parent's accumulated child time would count it twice.
+3. **`wait4`** — the `ProcessState` of a `snapshot-e2e` stage's kopia
+   invocation. On Linux the kernel fills `wait4`'s rusage with `RUSAGE_BOTH` of
+   the dead child, so it *includes* the CPU of the child's own reaped children —
+   the rclone grandchild. It is folded in with `max()`, never `+`, so it can only
+   raise a floor.
+
+**Reconciliation.** A process attributed live and later reaped also lands in
+`RUSAGE_CHILDREN`. The harness keeps a per-process ledger of how much of each
+descendant's cumulative CPU has already been accounted for; when a descendant
+disappears, exactly that much is subtracted from the reap lump, and only the
+remainder — the tail it burned after its last observation — is charged. So a
+`snapshot-e2e` stage on the rclone lane accounts for kopia **and** its rclone
+grandchild, once each.
+
+**Known limits, stated rather than hidden.**
+
+- Non-Linux platforms have no `proc` source: `cpu_source` reads `"rusage"`, a
+  grandchild is invisible, and a phase whose child outlives it reports **no**
+  child CPU rather than a wrong one.
+- Windows has no `getrusage` either; only the `wait4`-equivalent
+  (`os.ProcessState`) times survive.
+- The `proc` walk counts **every** descendant, including one that is merely idle
+  — on the rclone lane the harness's own `rclone serve webdav` is alive during a
+  `snapshot-e2e` stage and contributes its (near-zero) idle CPU to it. That is a
+  real cost of the configuration, not an error, but it is not *caused* by the
+  stage.
+
+#### `cpu_residual_ms` — the audit
+
+`trials[]` gains two fields:
+
+| Field | Meaning |
+|---|---|
+| `cpu_total_ms` | float; the CPU the **whole trial** cost the machine: `RUSAGE_SELF` delta + `RUSAGE_CHILDREN` delta + the increment of every descendant still alive at the end (which is therefore not in `RUSAGE_CHILDREN` yet). The three terms are disjoint by construction. |
+| `cpu_residual_ms` | float; `cpu_total_ms` − Σ(`cpu_total_ms` of the trial's phases): the CPU the trial spent that **no measured phase claimed**. |
+
+The residual exists so that an attribution leak is visible **in the result
+document itself** rather than having to be inferred. The CPU a workload spends
+outside its measured phase is real: `read-metadata`, `range-read`, `list-heavy`
+and `delete-sweep` all write their working set as unmeasured setup, every
+workload's cleanup deletes are unmeasured, and on the rclone lane spawning
+`rclone serve webdav` and shutting it down again happens between phases.
+**Expected magnitude: single-digit percent of `cpu_total_ms` on the native lane
+and roughly 5–15 % on the rclone lane** (its setup does more work and its
+subprocess is started and stopped once per workload). A residual comparable to
+the sum of the phases means the phases stopped seeing a subprocess — the CPU did
+not vanish, it moved here.
+
+#### Comparison and baselines
+
+- `cpu_total_ms` **is** a compared metric (§6): `compare` reports it and applies
+  the REAL/WEAK/NOISE rule to it like any other.
+- `cpu_total_ms` is deliberately **not** a key metric, so no `baseline check`
+  ever fails on it. Both lanes of a comparison are measured minutes apart on one
+  machine, and the CPU a desktop has spare depends on whatever else its operator
+  is running; a baseline promoted on a quiet machine would fail every check made
+  on a busy one. `compare` flags it, a human reads it, nothing fails a build over
+  it.
+
+#### The accounting tripwire
+
+The failure mode here is asymmetric and flattering: a lane whose subprocess CPU
+was not attributed reports a small number that *looks* like a win. Seconds of
+WebDAV-over-TLS traffic cannot cost single-digit milliseconds of CPU. So a phase
+with at least **1 s** of wall clock whose `cpu_total_ms` is below
+`max(20 ms, 0.5 % of wall clock)` is treated as **broken accounting, not a
+measurement**: `gdrive-bench graph` draws that cell as a red hatch labelled
+`BROKEN-ACCOUNTING` instead of a bar, and a report must say so in words.
+
+### 8.9 New subcommand: `graph`
+
+```
+gdrive-bench graph <result.json|compare.json> --out-dir <dir> [--prefix=name-]
+```
+
+Renders a run result **or** a comparison report as self-contained SVG files. It
+reads both document kinds by probing for `trials` / `rows`, and a run result is
+summarized through exactly the same code path `compare` uses, so a chart and a
+comparison table can never disagree. It writes, skipping any chart the document
+has no data for:
+
+| File | What it shows |
+|---|---|
+| `wall-clock-linear.svg` | median `wall_clock_ms` per workload, one bar per lane, one linear axis |
+| `wall-clock-split.svg` | the same data faceted into magnitude bands, each panel linear with **its own** axis |
+| `snapshot-stages.svg` | the `snapshot-e2e` stages, side by side per stage |
+| `cpu-total.svg` | median `cpu_total_ms` per workload, with the tripwire above applied |
+| `quota-units.svg` | median `quota_units` per workload, **reference lane only** (§5: the other lane's quota is unobservable, and a zero-height bar would state something false) |
+
+Contract of the output:
+
+- **Self-contained and inert.** Stdlib-only generation, no scripting, no external
+  stylesheet, font or image; one embedded `<style>` element and a baked light
+  surface rectangle, because an SVG pasted into a GitHub comment cannot rely on
+  `prefers-color-scheme` and dark ink on a transparent background is invisible in
+  GitHub's dark theme. 900 px wide, which is about the width a GitHub comment
+  renders an image at.
+- **Every chart carries its own context**: title, units, the number of trials
+  behind every median, the `[p10..p90]` interval over every bar, and a caption
+  naming the run label, the date, the source file and the harness commit.
+- **Significance is drawn, not just described.** A row whose two intervals
+  overlap (anything but `REAL`) is dimmed and labelled with its verdict.
+- **Split panels are labelled as such.** Bar lengths are comparable *inside* a
+  panel and meaningless *across* panels; the subtitle says so. A log axis was
+  rejected for the same reason — a bar twice as long would not be twice the time.
+
+`graph` never writes outside `--out-dir` and never modifies its input. Exit codes
+follow §7.

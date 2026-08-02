@@ -100,16 +100,16 @@ func TestMetricValue(t *testing.T) {
 	}
 
 	for metric, want := range cases {
-		got, ok := metricValue(m, metric)
+		got, ok := metricValue(&m, metric)
 		require.True(t, ok, metric)
 		require.InDelta(t, want, got, 1e-9, metric)
 	}
 
-	_, ok := metricValue(m, "nosuchmetric")
+	_, ok := metricValue(&m, "nosuchmetric")
 	require.False(t, ok)
 
 	// Throughput is undefined for a workload that took no measurable time.
-	_, ok = metricValue(WorkloadMetrics{Ops: 1}, "ops_per_sec")
+	_, ok = metricValue(&WorkloadMetrics{Ops: 1}, "ops_per_sec")
 	require.False(t, ok)
 
 	require.True(t, higherIsBetter("ops_per_sec"))

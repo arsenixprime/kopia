@@ -101,6 +101,18 @@ type TrialResult struct {
 	// ErrorsByReason is the trial's Drive error tally, summed from the transport
 	// deltas of its workloads. Empty for backends without Drive instrumentation.
 	ErrorsByReason map[string]int64 `json:"errors_by_reason"`
+
+	// CPUTotalMS is the CPU the whole trial cost the machine - this process plus
+	// every descendant - and CPUResidualMS is the part of it that no measured
+	// phase claimed: workload setup writes, cleanup deletes, connection setup and
+	// teardown, and the idle gaps between phases.
+	//
+	// It is published because it is the audit of the per-phase attribution: if
+	// the phases stopped seeing the rclone subprocess, the CPU does not vanish,
+	// it moves here. A residual comparable to the sum of the phases is a leak,
+	// not a quiet measurement.
+	CPUTotalMS    float64 `json:"cpu_total_ms"`
+	CPUResidualMS float64 `json:"cpu_residual_ms"`
 }
 
 // WorkloadMetrics is what every workload reports.
@@ -118,6 +130,22 @@ type WorkloadMetrics struct {
 	// the planned operations otherwise. QuotaUnitsSource says which.
 	QuotaUnits       int64  `json:"quota_units"`
 	QuotaUnitsSource string `json:"quota_units_source"`
+
+	// CPU accounting for the phase, in milliseconds. CPUUserMS and CPUSysMS are
+	// the harness process's own RUSAGE_SELF delta; CPUChildrenUserMS and
+	// CPUChildrenSysMS are every descendant process's CPU attributed to the
+	// phase. CPUTotalMS is their sum and is the headline number: it is the only
+	// figure that compares a backend running INSIDE the harness against one whose
+	// work happens in an rclone subprocess. CPUPct is CPUTotalMS/WallClockMS in
+	// percent, so 100 is one core saturated. CPUSource names the accounting that
+	// produced the children columns - see cpu.go.
+	CPUUserMS         float64 `json:"cpu_user_ms"`
+	CPUSysMS          float64 `json:"cpu_sys_ms"`
+	CPUChildrenUserMS float64 `json:"cpu_children_user_ms"`
+	CPUChildrenSysMS  float64 `json:"cpu_children_sys_ms"`
+	CPUTotalMS        float64 `json:"cpu_total_ms"`
+	CPUPct            float64 `json:"cpu_pct"`
+	CPUSource         string  `json:"cpu_source"`
 
 	// PacedWaitMS is the total time this phase spent waiting for the pacer's
 	// steady-state token bucket - the pacer's error-free throttling, summed
@@ -182,9 +210,16 @@ type StatSummary struct {
 
 // metricNames are the per-workload metrics the comparison protocol understands,
 // in report order.
-var metricNames = []string{"wall_clock_ms", "p50_ms", "p90_ms", "p99_ms", "ops_per_sec", "errors", "bytes_up", "bytes_down", "quota_units", "paced_wait_ms"}
+var metricNames = []string{"wall_clock_ms", "p50_ms", "p90_ms", "p99_ms", "ops_per_sec", "errors", "bytes_up", "bytes_down", "quota_units", "paced_wait_ms", "cpu_total_ms"}
 
 // keyMetricNames are the metrics a baseline check regards as pass/fail signals.
+//
+// cpu_total_ms is deliberately NOT one of them. It is the headline number of a
+// lane comparison, where both lanes are measured minutes apart on the same
+// machine; it is a poor regression gate, because the CPU a desktop has spare
+// varies with whatever else the operator is running, and a baseline promoted on
+// a quiet machine would fail every check made on a busy one. Compare flags it,
+// a human reads it, and nothing fails a build over it.
 var keyMetricNames = []string{"wall_clock_ms", "p50_ms"}
 
 // higherIsBetter reports whether a larger value of a metric is an improvement.
@@ -193,8 +228,9 @@ func higherIsBetter(metric string) bool {
 	return metric == "ops_per_sec"
 }
 
-// metricValue extracts a named metric from a workload's metrics.
-func metricValue(m WorkloadMetrics, metric string) (float64, bool) {
+// metricValue extracts a named metric from a workload's metrics. The metrics
+// are passed by pointer only because the struct is large; nothing is mutated.
+func metricValue(m *WorkloadMetrics, metric string) (float64, bool) {
 	switch metric {
 	case "wall_clock_ms":
 		return m.WallClockMS, true
@@ -222,6 +258,28 @@ func metricValue(m WorkloadMetrics, metric string) (float64, bool) {
 		return float64(m.QuotaUnits), true
 	case "paced_wait_ms":
 		return m.PacedWaitMS, true
+	default:
+		return cpuMetricValue(m, metric)
+	}
+}
+
+// cpuMetricValue extracts one of the CPU metrics (§8.8 of SCHEMA.md). It is
+// split out of metricValue so that neither switch has to grow past the point a
+// reader can check it at a glance.
+func cpuMetricValue(m *WorkloadMetrics, metric string) (float64, bool) {
+	switch metric {
+	case "cpu_user_ms":
+		return m.CPUUserMS, true
+	case "cpu_sys_ms":
+		return m.CPUSysMS, true
+	case "cpu_children_user_ms":
+		return m.CPUChildrenUserMS, true
+	case "cpu_children_sys_ms":
+		return m.CPUChildrenSysMS, true
+	case "cpu_total_ms":
+		return m.CPUTotalMS, true
+	case "cpu_pct":
+		return m.CPUPct, true
 	default:
 		return 0, false
 	}

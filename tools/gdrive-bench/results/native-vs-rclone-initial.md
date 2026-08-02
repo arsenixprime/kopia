@@ -1,5 +1,11 @@
 # Native Google Drive backend vs. rclone — first interleaved comparison
 
+> **SUPERSEDED (2026-08-02) by `native-vs-rclone-cpu.md`**, which repeats this
+> experiment on the same machine, account and random seed and adds CPU
+> accounting, a corrected `read-metadata:warm` pass (see the erratum at the foot
+> of this file) and pacer instrumentation. This document is kept for the record;
+> where the two disagree, the newer one is the authority.
+
 **Question this answers:** on real Google Drive, with everything except the
 backend held constant, how does Kopia's native `gdrive` backend compare to the
 same Kopia driving the same Drive through `rclone serve webdav`?

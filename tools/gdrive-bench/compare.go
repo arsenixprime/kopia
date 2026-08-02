@@ -150,7 +150,7 @@ func buildSeries(files []string, results []*RunResult) []*seriesData {
 					m := tr.Workloads[wk]
 
 					for _, metric := range metricNames {
-						if v, ok := metricValue(m, metric); ok {
+						if v, ok := metricValue(&m, metric); ok {
 							s.add(wk, metric, v)
 						}
 					}

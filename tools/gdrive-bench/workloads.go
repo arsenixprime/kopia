@@ -495,9 +495,11 @@ func (s *sampler) failure(what string) error {
 	return errors.Wrapf(s.firstEr, "%v of %v %v operations failed, first error", s.errs, s.ops, what)
 }
 
-// one wraps a single set of metrics under the workload's own name.
-func one(name string, m WorkloadMetrics) []phaseMetrics {
-	return []phaseMetrics{{Key: name, Metrics: m}}
+// one wraps a single set of metrics under the workload's own name. The metrics
+// are passed by pointer only because the struct is large; the value is copied
+// into the returned phase and never aliased.
+func one(name string, m *WorkloadMetrics) []phaseMetrics {
+	return []phaseMetrics{{Key: name, Metrics: *m}}
 }
 
 // phaseKey builds the result key of a multi-phase workload.
@@ -551,7 +553,9 @@ func runSmallWrite(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) 
 		}
 	}
 
-	return one("small-write", s.finish(st)), s.failure("small-write")
+	m := s.finish(st)
+
+	return one("small-write", &m), s.failure("small-write")
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +585,9 @@ func runPackWrite(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 		}
 	}
 
-	return one("pack-write", s.finish(st)), s.failure("pack-write")
+	m := s.finish(st)
+
+	return one("pack-write", &m), s.failure("pack-write")
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +738,9 @@ func runRangeRead(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 		}
 	}
 
-	return one("range-read", s.finish(st)), s.failure("range-read")
+	m := s.finish(st)
+
+	return one("range-read", &m), s.failure("range-read")
 }
 
 // ---------------------------------------------------------------------------
@@ -765,7 +773,7 @@ func runListHeavy(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 	// the folder too.
 	full, fullErr := listPass(ctx, st, "", e.params.ListTraversals)
 	if fullErr != nil {
-		return one(phaseKey("list-heavy", "full"), full), fullErr
+		return one(phaseKey("list-heavy", "full"), &full), fullErr
 	}
 
 	prefixed, prefixedErr := listPass(ctx, st, e.prefix+"lh-", e.params.ListTraversals)
@@ -824,7 +832,7 @@ func runDeleteSweep(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error)
 	m := s.finish(st)
 	m.Params = map[string]int64{deleteSweepParallelismParam: int64(parallelism)}
 
-	return one("delete-sweep", m), s.failure("delete-sweep")
+	return one("delete-sweep", &m), s.failure("delete-sweep")
 }
 
 // deleteSweepParallelismParam is the key delete-sweep records its effective

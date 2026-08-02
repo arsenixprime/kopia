@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"text/tabwriter"
 
 	_ "github.com/kopia/kopia/repo/blob/filesystem"
@@ -54,6 +55,7 @@ func commands() []command {
 		{"run", "run the workload suite against one or more targets and write a result document", cmdRun},
 		{"compare", "compare two or more result documents and flag significant differences", cmdCompare},
 		{"baseline", "set or check the promoted baseline result (baseline set|check <file>)", cmdBaseline},
+		{"graph", "render a result or comparison document as self-contained SVG charts", cmdGraph},
 		{"knobs", "dump every tunable knob, its default, range hint and affected workloads as JSON", cmdKnobs},
 		{"publish", "copy a result or report into the repository's curated results directory", cmdPublish},
 	}
@@ -139,6 +141,59 @@ func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 	}
 
 	return exitOK, true
+}
+
+// flagsFirst moves positional arguments behind the flags.
+//
+// Go's flag package stops parsing at the first non-flag argument, so
+// "graph result.json --out-dir x" would otherwise leave --out-dir unset and the
+// subcommand would refuse a command line that reads perfectly well. Only the
+// subcommands documented with a trailing flag use it.
+//
+// A flag's value is carried along with it when it is given as two words, which
+// is what the FlagSet lookup is for: a boolean flag must not swallow the file
+// name that follows it.
+func flagsFirst(fs *flag.FlagSet, args []string) []string {
+	flags := []string{}
+	positional := []string{}
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+
+			break
+		}
+
+		if len(a) < 2 || a[0] != '-' {
+			positional = append(positional, a)
+
+			continue
+		}
+
+		flags = append(flags, a)
+
+		name := strings.TrimLeft(a, "-")
+		if strings.ContainsRune(name, '=') {
+			continue
+		}
+
+		if f := fs.Lookup(name); f != nil && !isBoolFlag(f) && i+1 < len(args) {
+			i++
+
+			flags = append(flags, args[i])
+		}
+	}
+
+	return append(flags, positional...)
+}
+
+// isBoolFlag reports whether a flag is one that takes no separate value.
+func isBoolFlag(f *flag.Flag) bool {
+	bf, ok := f.Value.(interface{ IsBoolFlag() bool })
+
+	return ok && bf.IsBoolFlag()
 }
 
 // outf writes a formatted line to a harness output stream. Every message the

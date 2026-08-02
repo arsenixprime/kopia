@@ -31,3 +31,19 @@ check before publishing), and anything larger than a few hundred kilobytes.
 
 Each published artifact should be accompanied by a line in the commit message,
 or a short `.md` next to it, saying what question it answers.
+
+## Charts
+
+`graphs/` holds SVGs written by `gdrive-bench graph <document> --out-dir`. They
+are not `publish`-able (that subcommand curates `.json` and `.md` only) because
+they are *derived* from a published document rather than promoted from a run:
+regenerating them from the comparison JSON next to them must always reproduce
+them. Each set is prefixed with the run label it was generated from.
+
+## What is here today
+
+| Artifact | Question it answers |
+|---|---|
+| `native-vs-rclone-cpu.md` + `.compare.json` + `graphs/native-vs-rclone-cpu-*.svg` | **current** — native vs rclone on wall clock **and CPU**, 5 ABBA trials, 2026-08-02 |
+| `native-vs-rclone-initial.md` + `.compare.json` | superseded by the above; kept for the record (its `read-metadata:warm` rows are withdrawn by its own erratum) |
+| `recommended-baseline.json` | the promoted baseline `gdrive-bench baseline check` guards against |

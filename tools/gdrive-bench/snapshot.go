@@ -335,8 +335,10 @@ func (k *kopiaRunner) runStages(ctx context.Context, specs ...stageSpec) ([]phas
 // should be read on wall_clock_ms.
 func (k *kopiaRunner) stage(ctx context.Context, up, down int64, args ...string) (WorkloadMetrics, error) {
 	t := timetrack.StartTimer()
-	out, err := k.run(ctx, args...)
+	cpu := startCPUMeter()
+	out, state, err := k.run(ctx, args...)
 	elapsed := t.Elapsed()
+	sample := cpu.stop().withProcessState(state)
 
 	ms := float64(elapsed.Nanoseconds()) / millisPerNanoFloat
 
@@ -351,6 +353,8 @@ func (k *kopiaRunner) stage(ctx context.Context, up, down int64, args ...string)
 		BytesUp:   up,
 		BytesDown: down,
 	}
+
+	sample.applyTo(&m)
 
 	if k.chargesQuota {
 		m.QuotaUnits = estimateStageQuotaUnits(up, down)
@@ -369,8 +373,12 @@ func (k *kopiaRunner) stage(ctx context.Context, up, down int64, args ...string)
 	return m, nil
 }
 
-// run invokes kopia with the harness's global flags prepended.
-func (k *kopiaRunner) run(ctx context.Context, args ...string) (string, error) {
+// run invokes kopia with the harness's global flags prepended. It returns the
+// child's ProcessState alongside its output, because that is where the stage's
+// exact child CPU comes from: on Linux the kernel fills wait4's rusage with the
+// dead child's SELF **and** CHILDREN times, so a kopia that spawned and reaped
+// an rclone of its own reports both.
+func (k *kopiaRunner) run(ctx context.Context, args ...string) (string, *os.ProcessState, error) {
 	full := append([]string{
 		"--config-file=" + k.configPath,
 		"--log-dir=" + k.logDir,
@@ -386,7 +394,7 @@ func (k *kopiaRunner) run(ctx context.Context, args ...string) (string, error) {
 
 	err := cmd.Run()
 
-	return buf.String(), err
+	return buf.String(), cmd.ProcessState, err
 }
 
 // estimateStageQuotaUnits converts a stage's byte movement into Drive quota

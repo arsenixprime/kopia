@@ -115,6 +115,7 @@ func percentilesOf(values []float64) Percentiles {
 // CI self-test measures) do not all collapse onto zero.
 type sampler struct {
 	timer   timetrack.Timer
+	cpu     *cpuMeter
 	samples []float64
 	ops     int
 	errs    int
@@ -128,7 +129,7 @@ type sampler struct {
 // storage, the Drive API counters are snapshotted so the window can be
 // attributed; for every other backend the transport delta stays absent.
 func newSampler(st blob.Storage) *sampler {
-	s := &sampler{timer: timetrack.StartTimer()}
+	s := &sampler{timer: timetrack.StartTimer(), cpu: startCPUMeter()}
 
 	if st != nil {
 		if snap, ok := gdrive.StatsFromStorage(st); ok {
@@ -173,6 +174,10 @@ func (s *sampler) finish(st blob.Storage) WorkloadMetrics {
 		Samples:     len(s.samples),
 		Latency:     percentilesOf(s.samples),
 	}
+
+	// The CPU window closes with the wall clock, and cpu_pct needs WallClockMS to
+	// be set already.
+	s.cpu.stop().applyTo(&m)
 
 	if s.firstEr != nil {
 		m.Error = s.firstEr.Error()

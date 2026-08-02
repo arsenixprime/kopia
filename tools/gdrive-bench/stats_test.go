@@ -159,14 +159,14 @@ func TestPacedWaitReachesTheWorkloadMetric(t *testing.T) {
 
 	m := WorkloadMetrics{Transport: &delta, PacedWaitMS: float64(delta.PacedWaitMS)}
 
-	v, ok := metricValue(m, "paced_wait_ms")
+	v, ok := metricValue(&m, "paced_wait_ms")
 	require.True(t, ok)
 	require.InDelta(t, 1000.0, v, 1e-9)
 	require.Contains(t, metricNames, "paced_wait_ms")
 
 	// A backend without Drive instrumentation reports 0 rather than nothing, so
 	// the metric is always comparable.
-	zero, ok := metricValue(WorkloadMetrics{}, "paced_wait_ms")
+	zero, ok := metricValue(&WorkloadMetrics{}, "paced_wait_ms")
 	require.True(t, ok)
 	require.InDelta(t, 0.0, zero, 1e-9)
 }
