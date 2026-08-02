@@ -19,6 +19,8 @@ Kopia supports saving your [encrypted](features/#user-controlled-end-to-end-encr
 * **Azure Blob Storage**
 * **Backblaze B2**
 * **Google Cloud Storage**
+* **Google Drive**
+  * Supported natively (Kopia CLI only) and through Rclone (see below); the two are not interchangeable, so pick one
 * Any remote server or cloud storage that supports **WebDAV**
 * Any remote server or cloud storage that supports **SFTP**
 * Some of the cloud storages supported by **Rclone**

@@ -72,7 +72,7 @@ func (c *storageGDriveFlags) Connect(ctx context.Context, isCreate bool, formatV
 func init() {
 	mustRegisterStorageProvider(
 		"gdrive",
-		"a Google Drive folder [Not maintained]",
+		"a Google Drive folder",
 		func() StorageFlags { return &storageGDriveFlags{} },
 	)
 }
