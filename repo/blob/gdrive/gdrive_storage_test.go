@@ -4,9 +4,11 @@ package gdrive
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,9 +48,19 @@ const (
 func newMockStorage(t *testing.T) (*fakeDrive, blob.Storage) {
 	t.Helper()
 
+	return newTunedMockStorage(t, func(*Options) {})
+}
+
+// newTunedMockStorage is newMockStorage with a chance to adjust the options
+// before the storage is opened.
+func newTunedMockStorage(t *testing.T, adjust func(*Options)) (*fakeDrive, blob.Storage) {
+	t.Helper()
+
 	ctx := testlogging.Context(t)
 	d := newFakeDrive(t)
 	opt := d.options(t, testutil.TempDirectory(t))
+
+	adjust(opt)
 
 	st, err := New(ctx, opt, false)
 	require.NoError(t, err)
@@ -473,6 +485,450 @@ func TestGdriveStorageMockListPaging(t *testing.T) {
 }
 
 //
+// --------------------------------------------------------------- bulk deletes
+//
+
+// bulkDeleteBlobs is the shape of a maintenance-style delete: many blobs
+// written by this connection, then removed through blob.DeleteMultiple, which
+// is the only bulk-delete path Kopia has (repo/blob/storage.go:368).
+const (
+	bulkDeleteBlobCount   = 200
+	bulkDeleteParallelism = 8
+
+	// A 1 ms pacer interval with a burst of one makes the steady-state rate
+	// observable without making the test slow: N calls cannot complete in less
+	// than (N-1) ms, and that lower bound is what proves every delete went
+	// through the pacer.
+	bulkDeletePacerMinSleepMS = 1
+)
+
+func putBulkDeleteBlobs(ctx context.Context, t *testing.T, st blob.Storage) []blob.ID {
+	t.Helper()
+
+	ids := make([]blob.ID, 0, bulkDeleteBlobCount)
+
+	for i := range bulkDeleteBlobCount {
+		id := blob.ID(fmt.Sprintf("bulk-%04d", i))
+		require.NoError(t, st.PutBlob(ctx, id, gather.FromSlice([]byte("x")), blob.PutOptions{}))
+
+		ids = append(ids, id)
+	}
+
+	return ids
+}
+
+func tuneForBulkDeletes(useBatch bool) func(*Options) {
+	return func(opt *Options) {
+		opt.Tuning.PacerMinSleepMS = bulkDeletePacerMinSleepMS
+		opt.Tuning.PacerBurst = 1
+		opt.Tuning.DeleteParallelism = bulkDeleteParallelism
+		opt.Tuning.UseBatchDelete = &useBatch
+	}
+}
+
+// TestGdriveStorageMockParallelDeletes pins the cost of the default delete
+// path: one files.delete per blob and nothing else. The blobs were written by
+// this connection, so every file ID is cached, and a delete that spent a
+// files.list to re-resolve a name it already knows would double the quota bill
+// of every maintenance run.
+func TestGdriveStorageMockParallelDeletes(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newTunedMockStorage(t, tuneForBulkDeletes(false))
+
+	ids := putBulkDeleteBlobs(ctx, t, st)
+
+	listsBefore := d.requestCount(methodFilesList)
+	started := clock.Now()
+
+	require.NoError(t, blob.DeleteMultiple(ctx, st, ids, bulkDeleteParallelism))
+
+	elapsed := clock.Now().Sub(started)
+
+	require.Equal(t, bulkDeleteBlobCount, d.requestCount(methodFilesDelete))
+	require.Equal(t, listsBefore, d.requestCount(methodFilesList), "a cached file ID must not be re-resolved by name")
+	require.Zero(t, d.requestCount(methodBatch))
+	require.Empty(t, d.fileIDsNamed(string(ids[0])))
+
+	require.LessOrEqual(t, d.peakConcurrency(methodFilesDelete), bulkDeleteParallelism,
+		"deletes must respect the configured concurrency ceiling")
+
+	// Every call went through the shared token bucket, so the wall clock cannot
+	// be shorter than the steady-state rate allows.
+	require.GreaterOrEqual(t, elapsed, (bulkDeleteBlobCount-1)*bulkDeletePacerMinSleepMS*time.Millisecond)
+
+	t.Logf("%v parallel deletes: %v calls, %v", bulkDeleteBlobCount, d.requestCount(methodFilesDelete), elapsed)
+}
+
+// holdBatchWindowOpen makes the collector wait for a full batch rather than for
+// the clock, which is what turns a timing-dependent coalescing test into a
+// deterministic one: with a window this long the only thing that can release a
+// batch is it reaching maxBatchDeleteSize.
+func holdBatchWindowOpen(t *testing.T, st blob.Storage) {
+	t.Helper()
+
+	c := mustGdriveStorage(t, st).deleteBatch
+	require.NotNil(t, c)
+
+	c.window = time.Minute
+}
+
+// TestGdriveStorageMockBatchDeletes is the same workload through the batch
+// endpoint: 100 concurrent deletes become ONE HTTP round trip instead of 100.
+// Quota is unaffected - Drive charges a batch of n as n requests - so this is
+// purely the RTT experiment Phase 3 has to settle.
+func TestGdriveStorageMockBatchDeletes(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newTunedMockStorage(t, tuneForBulkDeletes(true))
+
+	holdBatchWindowOpen(t, st)
+
+	ids := putBulkDeleteBlobs(ctx, t, st)[:maxBatchDeleteSize]
+
+	listsBefore := d.requestCount(methodFilesList)
+	started := clock.Now()
+
+	require.NoError(t, blob.DeleteMultiple(ctx, st, ids, len(ids)))
+
+	elapsed := clock.Now().Sub(started)
+
+	require.Equal(t, 1, d.requestCount(methodBatch))
+	require.Equal(t, len(ids), d.requestCount(methodFilesDelete),
+		"a batch of n still executes n deletes; only the round trips are saved")
+	require.Equal(t, listsBefore, d.requestCount(methodFilesList))
+
+	for _, id := range ids {
+		require.Empty(t, d.fileIDsNamed(string(id)))
+	}
+
+	t.Logf("%v batched deletes: %v batch calls, %v", len(ids), d.requestCount(methodBatch), elapsed)
+}
+
+// TestGdriveStorageMockBatchDeleteCoalescing runs the full 200-blob workload
+// with the production window. Exactly how the arrivals fall into batches is a
+// scheduling detail, but the order of magnitude is not: 200 deletes must cost a
+// handful of round trips, not 200.
+func TestGdriveStorageMockBatchDeleteCoalescing(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newTunedMockStorage(t, tuneForBulkDeletes(true))
+
+	ids := putBulkDeleteBlobs(ctx, t, st)
+
+	require.NoError(t, blob.DeleteMultiple(ctx, st, ids, bulkDeleteBlobCount))
+
+	batches := d.requestCount(methodBatch)
+
+	require.Equal(t, bulkDeleteBlobCount, d.requestCount(methodFilesDelete))
+	require.GreaterOrEqual(t, batches, bulkDeleteBlobCount/maxBatchDeleteSize,
+		"a batch cannot hold more than %v calls", maxBatchDeleteSize)
+	require.LessOrEqual(t, batches, bulkDeleteBlobCount/10, "the deletes were not coalesced")
+
+	for _, id := range ids {
+		require.Empty(t, d.fileIDsNamed(string(id)))
+	}
+
+	t.Logf("%v deletes coalesced into %v batches", bulkDeleteBlobCount, batches)
+}
+
+// TestGdriveStorageMockBatchDeleteMixedParts drives the part-level error
+// semantics: one file has already been deleted behind the backend's back (404)
+// and one part is rate-limited (403). Every caller must still get the right
+// answer, the rate-limited part must be retried - alone - and no successful
+// part may be executed twice.
+func TestGdriveStorageMockBatchDeleteMixedParts(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newTunedMockStorage(t, tuneForBulkDeletes(true))
+
+	holdBatchWindowOpen(t, st)
+
+	const n = maxBatchDeleteSize
+
+	ids := make([]blob.ID, 0, n)
+
+	for i := range n {
+		id := blob.ID(fmt.Sprintf("mixed-%03d", i))
+		require.NoError(t, st.PutBlob(ctx, id, gather.FromSlice([]byte("x")), blob.PutOptions{}))
+
+		ids = append(ids, id)
+	}
+
+	// One blob disappears from under us: its part comes back 404, which for a
+	// delete means the blob is already gone.
+	vanished := d.fileIDsNamed(string(ids[n-1]))
+	require.Len(t, vanished, 1)
+	d.deleteFileDirectly(vanished[0])
+
+	// ... and one part is throttled. The pacer must back the whole backend off
+	// and re-send only that part.
+	d.injectFailure(methodFilesDelete, http.StatusForbidden, "rateLimitExceeded")
+
+	deletesBefore := d.requestCount(methodFilesDelete)
+
+	require.NoError(t, blob.DeleteMultiple(ctx, st, ids, n))
+
+	for _, id := range ids {
+		require.Emptyf(t, d.fileIDsNamed(string(id)), "blob %v survived", id)
+	}
+
+	require.Equal(t, 2, d.requestCount(methodBatch), "the throttled part should have been retried in a second batch")
+	require.Equal(t, n+1, d.requestCount(methodFilesDelete)-deletesBefore,
+		"only the throttled part may be re-executed")
+
+	snap, ok := StatsFromStorage(st)
+	require.True(t, ok)
+	require.Positive(t, snap.PerMethod[methodBatch].Retries)
+	require.Positive(t, snap.ErrorsByReason["rateLimitExceeded"])
+}
+
+// TestGdriveStorageMockBatchDeletePerCallerResults pins the property that makes
+// batching safe at all: a part that fails permanently fails ITS OWN caller and
+// nobody else's. A batch is not a transaction.
+func TestGdriveStorageMockBatchDeletePerCallerResults(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newTunedMockStorage(t, tuneForBulkDeletes(true))
+
+	const n = 20
+
+	ids := make([]blob.ID, 0, n)
+
+	for i := range n {
+		id := blob.ID(fmt.Sprintf("percaller-%02d", i))
+		require.NoError(t, st.PutBlob(ctx, id, gather.FromSlice([]byte("x")), blob.PutOptions{}))
+
+		ids = append(ids, id)
+	}
+
+	// One part - whichever Drive handles first - is refused outright.
+	d.injectFailure(methodFilesDelete, http.StatusForbidden, "insufficientFilePermissions")
+
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		failed []blob.ID
+	)
+
+	for _, id := range ids {
+		wg.Go(func() {
+			err := st.DeleteBlob(ctx, id)
+			if err == nil {
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			failed = append(failed, id)
+		})
+	}
+
+	wg.Wait()
+
+	require.Len(t, failed, 1, "exactly one caller should have seen the refusal")
+
+	for _, id := range ids {
+		if id == failed[0] {
+			require.NotEmpty(t, d.fileIDsNamed(string(id)), "the refused blob must still be there")
+			continue
+		}
+
+		require.Emptyf(t, d.fileIDsNamed(string(id)), "blob %v shared a batch with a failing part and survived", id)
+	}
+}
+
+// TestGdriveStorageMockBatchEnvelopeFailure covers the other failure axis: the
+// batch request itself is rejected, so no part ran and the whole batch is
+// retried through the pacer.
+func TestGdriveStorageMockBatchEnvelopeFailure(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newTunedMockStorage(t, tuneForBulkDeletes(true))
+
+	holdBatchWindowOpen(t, st)
+
+	ids := putBulkDeleteBlobs(ctx, t, st)[:maxBatchDeleteSize]
+
+	d.injectFailure(methodBatch, http.StatusServiceUnavailable, "backendError")
+
+	require.NoError(t, blob.DeleteMultiple(ctx, st, ids, len(ids)))
+
+	require.Equal(t, 2, d.requestCount(methodBatch), "the rejected envelope should have been re-sent whole")
+	require.Equal(t, len(ids), d.requestCount(methodFilesDelete), "a rejected envelope executes no parts")
+
+	for _, id := range ids {
+		require.Empty(t, d.fileIDsNamed(string(id)))
+	}
+}
+
+// TestGdriveStorageMockBatchDeleteSingle covers the degenerate batch: one
+// delete with no company is sent as a plain files.delete, because wrapping a
+// single call in a batch envelope is strictly more work than making it.
+func TestGdriveStorageMockBatchDeleteSingle(t *testing.T) {
+	ctx := testlogging.Context(t)
+	useBatch := true
+	d, st := newTunedMockStorage(t, func(opt *Options) { opt.Tuning.UseBatchDelete = &useBatch })
+
+	require.NoError(t, st.PutBlob(ctx, "lonely", gather.FromSlice([]byte("x")), blob.PutOptions{}))
+	require.NoError(t, st.DeleteBlob(ctx, "lonely"))
+
+	require.Zero(t, d.requestCount(methodBatch))
+	require.Equal(t, 1, d.requestCount(methodFilesDelete))
+	require.Empty(t, d.fileIDsNamed("lonely"))
+}
+
+func TestBatchEndpoint(t *testing.T) {
+	cases := []struct {
+		basePath string
+		want     string
+		wantErr  bool
+	}{
+		{basePath: "https://www.googleapis.com/drive/v3/", want: "https://www.googleapis.com/batch/drive/v3"},
+		{basePath: "http://127.0.0.1:8080/drive/v3/", want: "http://127.0.0.1:8080/batch/drive/v3"},
+		{basePath: "https://example.com/api/drive/v3/", want: "https://example.com/api/batch/drive/v3"},
+		{basePath: "https://example.com/v2/", wantErr: true},
+	}
+
+	for _, tc := range cases {
+		got, err := batchEndpoint(tc.basePath)
+
+		if tc.wantErr {
+			require.Errorf(t, err, "batchEndpoint(%q)", tc.basePath)
+
+			continue
+		}
+
+		require.NoErrorf(t, err, "batchEndpoint(%q)", tc.basePath)
+		require.Equal(t, tc.want, got)
+	}
+}
+
+//
+// ------------------------------------------------------- absent-blob latency
+//
+
+// TestGdriveStorageMockAbsentBlobIsFast pins the fix for the escalation budget:
+// a blob nobody ever wrote is reported missing after one confirming query, not
+// after a ladder of six spread over five seconds. Kopia asks about absent blobs
+// constantly, and the old budget charged every one of those questions.
+func TestGdriveStorageMockAbsentBlobIsFast(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newMockStorage(t)
+
+	// Quiesce the ID cache journal: with no write activity, a miss has no reason
+	// to suspect a lagging index.
+	require.NoError(t, st.FlushCaches(ctx))
+
+	before := d.requestCount(methodFilesList)
+	started := clock.Now()
+
+	_, err := st.GetMetadata(ctx, "definitely-not-there")
+	elapsed := clock.Now().Sub(started)
+
+	require.ErrorIs(t, err, blob.ErrBlobNotFound)
+	require.Less(t, elapsed, time.Second, "an absent blob must not cost a retry ladder")
+	require.Equal(t, 2, d.requestCount(methodFilesList)-before, "one query plus one confirming query")
+
+	t.Logf("absent-blob lookup took %v", elapsed)
+}
+
+// TestGdriveStorageMockJournalTailRescan proves the other half of the same
+// change: a blob written by ANOTHER PROCESS on this machine is found by
+// re-reading the shared cache journal, with no additional Drive query at all.
+//
+// The other process is simulated by appending a record to the journal file the
+// way that process would - a single write(2) of an encoded record onto the
+// O_APPEND journal - while the file it names is one this connection's name
+// queries cannot see, so a hit can only have come from the journal.
+func TestGdriveStorageMockJournalTailRescan(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newMockStorage(t)
+
+	const blobID = blob.ID("written-elsewhere")
+
+	// The other process's file. It is deliberately NOT named after the blob, so
+	// that no name query can resolve it.
+	fileID := d.addFile("some-other-name", []byte("hello"), clock.Now())
+
+	s := mustGdriveStorage(t, st)
+
+	appendJournalRecord(t, s.idCache.journalPath, blobID, fileID)
+
+	listsBefore := d.requestCount(methodFilesList)
+	started := clock.Now()
+
+	bm, err := st.GetMetadata(ctx, blobID)
+	elapsed := clock.Now().Sub(started)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(5), bm.Length)
+	require.Equal(t, 1, d.requestCount(methodFilesList)-listsBefore,
+		"the journal must answer the miss without a second name query")
+	require.Less(t, elapsed, time.Second)
+
+	// ... and the mapping is now in memory, so the next read costs nothing at all.
+	cached, ok := s.idCache.Get(blobID)
+	require.True(t, ok)
+	require.Equal(t, fileID, cached)
+}
+
+// appendJournalRecord writes one blobID->fileID record onto the end of a file ID
+// journal exactly as a second Kopia process would.
+func appendJournalRecord(t *testing.T, journalPath string, blobID blob.ID, fileID string) {
+	t.Helper()
+
+	rec, ok := encodeRecord(blobID, fileID)
+	require.True(t, ok)
+
+	f, err := os.OpenFile(journalPath, os.O_WRONLY|os.O_APPEND, cacheFileMode)
+	require.NoError(t, err)
+
+	defer f.Close() //nolint:errcheck
+
+	_, err = f.Write(rec)
+	require.NoError(t, err)
+}
+
+//
+// ------------------------------------------------------------ list narrowing
+//
+
+// TestGdriveStorageMockListPrefixNarrowing covers the server-side `name
+// contains` narrowing and, more importantly, the client-side filter that backs
+// it up: `contains` is a substring match, so the server can and does return
+// names that merely embed the prefix.
+func TestGdriveStorageMockListPrefixNarrowing(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newMockStorage(t)
+
+	for _, id := range []blob.ID{"_log_aaa", "_log_bbb", "x_log_ccc", "other"} {
+		require.NoError(t, st.PutBlob(ctx, id, gather.FromSlice([]byte(id)), blob.PutOptions{}))
+	}
+
+	blobtesting.AssertListResultsIDs(ctx, t, st, "_log_", "_log_aaa", "_log_bbb")
+	require.Contains(t, d.listQuery(), "name contains '_log_'", "a long prefix should be pushed to the server")
+
+	// Short prefixes are not narrowed: they select most of the repository, so the
+	// term would cost a query condition and buy nothing.
+	blobtesting.AssertListResultsIDs(ctx, t, st, "o", "other")
+	require.NotContains(t, d.listQuery(), "name contains")
+}
+
+// TestGdriveStorageMockCaseInsensitiveNameQuery pins the other Drive quirk the
+// listing path has to defend against: `name = 'x'` matches "X" as well, so a
+// repository holding two blobs whose IDs differ only in case would otherwise
+// serve one blob's bytes for the other.
+func TestGdriveStorageMockCaseInsensitiveNameQuery(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d, st := newMockStorage(t)
+
+	d.addFile("MixedCase", []byte("upper!"), clock.Now())
+	d.addFile("mixedcase", []byte("lower-case-content"), clock.Now().Add(time.Hour))
+
+	require.NoError(t, st.FlushCaches(ctx))
+	blobtesting.AssertGetBlob(ctx, t, st, "MixedCase", []byte("upper!"))
+
+	require.NoError(t, st.FlushCaches(ctx))
+	blobtesting.AssertGetBlob(ctx, t, st, "mixedcase", []byte("lower-case-content"))
+}
+
+//
 // ---------------------------------------------------------------- live suite
 //
 
@@ -514,6 +970,161 @@ func TestGdriveStorageLive(t *testing.T) {
 		for method, ms := range snap.PerMethod {
 			t.Logf("stats %-18s calls=%-6d errors=%-4d retries=%-4d up=%-10d down=%-10d", method, ms.Calls, ms.Errors, ms.Retries, ms.BytesUp, ms.BytesDown)
 		}
+	}
+}
+
+// TestGdriveLivePrefixNarrowing verifies against real Drive that pushing a long
+// listing prefix into the query with `name contains` neither loses a blob that
+// matches nor is trusted to exclude one that does not. The decoy blob embeds
+// the prefix without starting with it, which `contains` matches and the
+// client-side filter must reject.
+//
+// It is deliberately NOT named ...StorageLive..., so that it is not swept up by
+// the routine live run.
+func TestGdriveLivePrefixNarrowing(t *testing.T) {
+	t.Parallel()
+	testutil.ProviderTest(t)
+
+	ctx := testlogging.Context(t)
+	st, cleanup := newLiveTestStorage(ctx, t)
+
+	defer cleanup()
+
+	prefix := blob.ID("narrow" + strings.ReplaceAll(uuid.NewString(), "-", "") + "-")
+
+	want := []blob.ID{prefix + "one", prefix + "two"}
+	decoy := "x" + prefix + "three"
+
+	for _, id := range append(append([]blob.ID{}, want...), decoy) {
+		require.NoError(t, st.PutBlob(ctx, id, gather.FromSlice([]byte("x")), blob.PutOptions{}))
+	}
+
+	blobtesting.AssertListResultsIDs(ctx, t, st, prefix, want...)
+
+	// ... and a prefix below the narrowing threshold still works, through the
+	// client-side filter alone.
+	blobtesting.AssertListResultsIDs(ctx, t, st, "x"+prefix[:1], decoy)
+}
+
+// TestGdriveLiveDeleteBenchmark measures the two delete paths against real
+// Drive: bounded-parallel singles versus the batch endpoint, each with the
+// production pacer and with the pacer relaxed so that the round trips rather
+// than the rate limiter dominate.
+//
+// It reports rather than asserts (beyond correctness): the number this produces
+// is the first real data point for the Phase 3 A/B, and the default stays where
+// PHASE2_DESIGN.md put it until that measurement is made properly.
+func TestGdriveLiveDeleteBenchmark(t *testing.T) {
+	t.Parallel()
+	testutil.ProviderTest(t)
+
+	ctx := testlogging.Context(t)
+
+	const blobCount = 200
+
+	cases := []struct {
+		name     string
+		batch    bool
+		minSleep int
+	}{
+		{name: "parallel-singles/default-pacer", batch: false},
+		{name: "batch/default-pacer", batch: true},
+		{name: "parallel-singles/relaxed-pacer", batch: false, minSleep: 1},
+		{name: "batch/relaxed-pacer", batch: true, minSleep: 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, cleanup := newLiveTestStorage(ctx, t, func(opt *Options) {
+				opt.Tuning.UseBatchDelete = &tc.batch
+				opt.Tuning.PacerMinSleepMS = tc.minSleep
+			})
+
+			defer cleanup()
+
+			ids := make([]blob.ID, 0, blobCount)
+
+			for i := range blobCount {
+				id := blob.ID(fmt.Sprintf("bench-%04d", i))
+				require.NoError(t, st.PutBlob(ctx, id, gather.FromSlice([]byte("x")), blob.PutOptions{}))
+
+				ids = append(ids, id)
+			}
+
+			before, ok := StatsFromStorage(st)
+			require.True(t, ok)
+
+			started := clock.Now()
+
+			require.NoError(t, blob.DeleteMultiple(ctx, st, ids, defaultDeleteParallelism))
+
+			elapsed := clock.Now().Sub(started)
+
+			after, _ := StatsFromStorage(st)
+
+			t.Logf("%v: %v blobs in %v (%.1f blobs/s)", tc.name, blobCount, elapsed, float64(blobCount)/elapsed.Seconds())
+
+			for _, m := range []string{methodFilesDelete, methodBatch, methodFilesList} {
+				d, a := before.PerMethod[m], after.PerMethod[m]
+				if a.Calls-d.Calls == 0 {
+					continue
+				}
+
+				t.Logf("    %-14s calls=%-5d errors=%-3d retries=%-3d backoffs=%-3d",
+					m, a.Calls-d.Calls, a.Errors-d.Errors, a.Retries-d.Retries, a.Backoffs-d.Backoffs)
+			}
+
+			// Correctness is not negotiable regardless of which path is faster.
+			blobtesting.AssertListResultsIDs(ctx, t, st, "bench-")
+		})
+	}
+}
+
+// TestGdriveLiveAbsentBlobLatency measures what a lookup of a blob nobody wrote
+// costs against real Drive, which is the number the escalation budget trades
+// against.
+func TestGdriveLiveAbsentBlobLatency(t *testing.T) {
+	t.Parallel()
+	testutil.ProviderTest(t)
+
+	ctx := testlogging.Context(t)
+	st, cleanup := newLiveTestStorage(ctx, t)
+
+	defer cleanup()
+
+	const samples = 5
+
+	var total time.Duration
+
+	for i := range samples {
+		started := clock.Now()
+
+		_, err := st.GetMetadata(ctx, blob.ID(fmt.Sprintf("absent-%v-%v", uuid.NewString(), i)))
+		require.ErrorIs(t, err, blob.ErrBlobNotFound)
+
+		total += clock.Now().Sub(started)
+	}
+
+	t.Logf("absent-blob GetMetadata: %v average over %v samples", total/samples, samples)
+}
+
+// newLiveTestStorage opens a storage on a fresh per-test Drive folder and
+// returns it with the function that removes the folder again.
+func newLiveTestStorage(ctx context.Context, t *testing.T, adjust ...func(*Options)) (blob.Storage, func()) {
+	t.Helper()
+
+	opt := createLiveTestFolder(ctx, t, mustGetLiveOptionsOrSkip(t))
+
+	for _, a := range adjust {
+		a(opt)
+	}
+
+	st, err := New(ctx, opt, false)
+	require.NoError(t, err)
+
+	return st, func() {
+		require.NoError(t, st.Close(ctx))
+		deleteLiveTestFolder(ctx, t, opt)
 	}
 }
 

@@ -119,6 +119,13 @@ type persistentIDCache struct {
 	diskRecords int
 	// +checklocks:writeMu
 	persistDisabled bool
+	// scanOffset is the byte offset just past the last record this process has
+	// replayed, and scanInfo identifies the file it was measured against. Together
+	// they make RescanTail an incremental read instead of a full replay.
+	// +checklocks:writeMu
+	scanOffset int64
+	// +checklocks:writeMu
+	scanInfo os.FileInfo
 
 	batchSize     int           // test hook
 	flushInterval time.Duration // test hook
@@ -359,6 +366,8 @@ func (c *persistentIDCache) resetLocked() error {
 
 	c.diskRecords = 0
 
+	c.noteScannedLocked(int64(len(journalHeader)))
+
 	return nil
 }
 
@@ -562,24 +571,40 @@ func (c *persistentIDCache) loadLocked() error {
 		return err
 	}
 
-	entries, records, damagedBytes, err := c.readJournal()
+	scan, err := c.readJournal()
 	if err != nil {
 		return err
 	}
 
-	if damagedBytes > 0 {
-		c.logger.Warnf("skipped %v damaged bytes in Google Drive file ID journal %v", damagedBytes, c.journalPath)
+	if scan.damaged > 0 {
+		c.logger.Warnf("skipped %v damaged bytes in Google Drive file ID journal %v", scan.damaged, c.journalPath)
 	}
 
 	c.mu.Lock()
-	c.entries = entries
+	c.entries = scan.entries
 	c.mu.Unlock()
 
-	c.diskRecords = records
+	c.diskRecords = scan.records
+	c.noteScannedLocked(scan.end)
 
 	c.maybeCompactLocked()
 
 	return nil
+}
+
+// noteScannedLocked records how far into the journal this process has replayed,
+// which is the starting point of the next incremental tail read.
+//
+// +checklocks:c.writeMu
+func (c *persistentIDCache) noteScannedLocked(end int64) {
+	st, err := os.Stat(c.journalPath)
+	if err != nil {
+		c.scanInfo, c.scanOffset = nil, 0
+
+		return
+	}
+
+	c.scanInfo, c.scanOffset = st, end
 }
 
 // writeNamespaceMarker records which folder a hashed directory belongs to. It
@@ -607,6 +632,19 @@ func (c *persistentIDCache) acquireFileLock() error {
 	}
 
 	return errors.Wrap(c.lock.Lock(), "unable to lock file ID cache")
+}
+
+// acquireSharedFileLock takes the cross-process advisory lock in shared mode,
+// which readers use: several processes may tail-read the journal at once, and
+// none of them blocks the others.
+//
+// +checklocks:c.writeMu
+func (c *persistentIDCache) acquireSharedFileLock() error {
+	if c.lock == nil {
+		return nil
+	}
+
+	return errors.Wrap(c.lock.RLock(), "unable to lock file ID cache for reading")
 }
 
 // +checklocks:c.writeMu
@@ -725,41 +763,62 @@ func (c *persistentIDCache) quarantineLocked(cause error) {
 	}
 }
 
-// readJournal replays the journal from the beginning. Damaged regions are
-// skipped, never fatal; only a failure to open or read the file is an error.
+// journalScan is the result of replaying part or all of the journal.
+type journalScan struct {
+	// entries holds the live mappings the replayed region produced: a record
+	// superseded by a later tombstone within the same region leaves no trace.
+	entries map[blob.ID]string
+	// records is the number of valid records the region held.
+	records int
+	// damaged is the number of bytes that could not be framed.
+	damaged int64
+	// end is the byte offset just past the last VALID record, which is where the
+	// next incremental read must resume. A torn record at the tail is therefore
+	// re-examined next time, by which point the writer may have completed it.
+	end int64
+}
+
+// readJournal replays the whole journal, which is what open() needs.
 //
 // +checklocks:c.writeMu
-func (c *persistentIDCache) readJournal() (map[blob.ID]string, int, int64, error) {
-	entries := map[blob.ID]string{}
+func (c *persistentIDCache) readJournal() (journalScan, error) {
+	return c.readJournalFrom(0)
+}
+
+// readJournalFrom replays the journal starting at byte offset start, which must
+// be either 0 (the header is then consumed first) or an offset previously
+// reported as journalScan.end. Damaged regions are skipped, never fatal; only a
+// failure to open or read the file is an error.
+//
+// +checklocks:c.writeMu
+func (c *persistentIDCache) readJournalFrom(start int64) (journalScan, error) {
+	res := journalScan{
+		entries: map[blob.ID]string{},
+		end:     start,
+	}
 
 	f, err := os.Open(c.journalPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return entries, 0, 0, nil
+			return journalScan{entries: res.entries}, nil
 		}
 
-		return nil, 0, 0, errors.Wrap(err, "unable to open file ID journal for reading")
+		return journalScan{}, errors.Wrap(err, "unable to open file ID journal for reading")
 	}
 
 	defer f.Close() //nolint:errcheck
 
-	hdr := make([]byte, len(journalHeader))
-
-	if _, err := io.ReadFull(f, hdr); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, 0, 0, errBadJournalMagic
+	if start == 0 {
+		if err := consumeJournalHeader(f); err != nil {
+			return journalScan{}, err
 		}
 
-		return nil, 0, 0, errors.Wrap(err, "unable to read file ID journal header")
-	}
-
-	if !bytes.Equal(hdr, []byte(journalHeader)) {
-		return nil, 0, 0, errBadJournalMagic
+		res.end = int64(len(journalHeader))
+	} else if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return journalScan{}, errors.Wrap(err, "unable to seek in file ID journal")
 	}
 
 	s := newJournalScanner(f)
-
-	records := 0
 
 	for {
 		blobID, fileID, ok := s.next()
@@ -767,20 +826,130 @@ func (c *persistentIDCache) readJournal() (map[blob.ID]string, int, int64, error
 			break
 		}
 
-		records++
+		res.records++
 
 		if fileID == "" {
-			delete(entries, blobID)
+			delete(res.entries, blobID)
 		} else {
-			entries[blobID] = fileID
+			res.entries[blobID] = fileID
 		}
 	}
 
 	if s.err != nil {
-		return nil, 0, 0, s.err
+		return journalScan{}, s.err
 	}
 
-	return entries, records, s.damaged, nil
+	res.damaged = s.damaged
+	res.end += s.lastRecordEnd
+
+	return res, nil
+}
+
+// consumeJournalHeader reads and validates the fixed header a journal starts
+// with, leaving the reader positioned at the first record.
+func consumeJournalHeader(r io.Reader) error {
+	hdr := make([]byte, len(journalHeader))
+
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return errBadJournalMagic
+		}
+
+		return errors.Wrap(err, "unable to read file ID journal header")
+	}
+
+	if !bytes.Equal(hdr, []byte(journalHeader)) {
+		return errBadJournalMagic
+	}
+
+	return nil
+}
+
+// RescanTail re-reads the records appended to the journal since this process
+// last replayed it, so that a blob written by ANOTHER process on this machine
+// can be resolved without a Drive round trip.
+//
+// It reports the file ID of blobID when the tail named it, and whether the tail
+// held any records at all - which the read path uses as evidence that somebody
+// is actively writing to this repository, and therefore that a name-index miss
+// is worth re-querying (see the commentary on nameQueryRetryBudget).
+//
+// The scan takes the cross-process lock in SHARED mode, so it never blocks
+// another process's reads and only ever waits behind one write(2)-sized
+// critical section.
+//
+// Records are applied ONLY to blob IDs this process does not already know. Our
+// own in-memory map is newer than anything on disk (appends are batched), so
+// re-reading our own records must not be allowed to revert it; and a blob we
+// already have an ID for does not need this path in the first place, because a
+// stale ID is corrected by the 404-invalidates rule.
+func (c *persistentIDCache) RescanTail(blobID blob.ID) (fileID string, found, appended bool) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	if c.persistDisabled {
+		return "", false, false
+	}
+
+	if err := c.acquireSharedFileLock(); err != nil {
+		c.logger.Debugf("unable to lock Google Drive file ID cache for a tail scan: %v", err)
+
+		return "", false, false
+	}
+
+	defer c.releaseFileLock()
+
+	st, err := os.Stat(c.journalPath)
+	if err != nil {
+		return "", false, false
+	}
+
+	// A journal that was replaced (another process compacted it) or that shrank
+	// cannot be read incrementally. Resynchronize on its current end rather than
+	// replaying it: a full replay would apply records this process has already
+	// superseded in memory. The compaction itself is write activity, so it is
+	// reported as such.
+	if c.scanInfo == nil || !os.SameFile(c.scanInfo, st) || st.Size() < c.scanOffset {
+		c.scanInfo, c.scanOffset = st, st.Size()
+
+		return "", false, true
+	}
+
+	if st.Size() == c.scanOffset {
+		return "", false, false
+	}
+
+	scan, err := c.readJournalFrom(c.scanOffset)
+	if err != nil {
+		c.logger.Debugf("unable to tail-read Google Drive file ID cache: %v", err)
+
+		return "", false, false
+	}
+
+	c.scanInfo, c.scanOffset = st, scan.end
+
+	if len(scan.entries) > 0 {
+		c.applyTailEntries(scan.entries)
+	}
+
+	c.mu.RLock()
+	fileID, found = c.entries[blobID]
+	c.mu.RUnlock()
+
+	return fileID, found, scan.records > 0
+}
+
+// applyTailEntries merges records read from the journal tail into the in-memory
+// map, leaving mappings this process already holds untouched.
+func (c *persistentIDCache) applyTailEntries(entries map[blob.ID]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for id, fileID := range entries {
+		if _, ok := c.entries[id]; !ok {
+			c.entries[id] = fileID
+		}
+	}
 }
 
 // compactLocked rewrites the journal with one record per live mapping. It
@@ -790,13 +959,16 @@ func (c *persistentIDCache) readJournal() (map[blob.ID]string, int, int64, error
 //
 // +checklocks:c.writeMu
 func (c *persistentIDCache) compactLocked() error {
-	entries, records, _, err := c.readJournal()
+	scan, err := c.readJournal()
 	if err != nil {
 		return err
 	}
 
-	if records <= len(entries) {
-		c.diskRecords = records
+	entries := scan.entries
+
+	if scan.records <= len(entries) {
+		c.diskRecords = scan.records
+		c.noteScannedLocked(scan.end)
 
 		return nil
 	}
@@ -862,6 +1034,14 @@ func (c *persistentIDCache) compactLocked() error {
 
 	c.diskRecords = written
 
+	// The compacted file holds exactly what this process has in memory, so the
+	// next tail read must start at its end.
+	if st, serr := os.Stat(c.journalPath); serr == nil {
+		c.scanInfo, c.scanOffset = st, st.Size()
+	} else {
+		c.scanInfo, c.scanOffset = nil, 0
+	}
+
 	return nil
 }
 
@@ -919,6 +1099,14 @@ type journalScanner struct {
 	damaged int64
 	eof     bool
 	err     error
+
+	// consumed counts every byte removed from buf, damaged or not, and
+	// lastRecordEnd is its value just after the most recent valid record. An
+	// incremental reader resumes at lastRecordEnd, so a record still being
+	// written when the file was read is examined again next time instead of
+	// being skipped forever.
+	consumed      int64
+	lastRecordEnd int64
 }
 
 func newJournalScanner(r io.Reader) *journalScanner {
@@ -957,6 +1145,7 @@ func (s *journalScanner) fill(n int) bool {
 func (s *journalScanner) skip(n int) {
 	s.buf = s.buf[n:]
 	s.damaged += int64(n)
+	s.consumed += int64(n)
 }
 
 func (s *journalScanner) next() (blob.ID, string, bool) {
@@ -1002,6 +1191,8 @@ func (s *journalScanner) next() (blob.ID, string, bool) {
 		}
 
 		s.buf = s.buf[total:]
+		s.consumed += int64(total)
+		s.lastRecordEnd = s.consumed
 
 		return blobID, fileID, true
 	}

@@ -808,6 +808,134 @@ func TestPersistentIDCacheRecordCodec(t *testing.T) {
 	require.False(t, ok, "zero-length blob IDs are not valid records")
 }
 
+// appendRawRecord writes one record onto the end of a journal the way another
+// process would: a single write(2) on an O_APPEND descriptor.
+func appendRawRecord(t *testing.T, journalPath string, blobID blob.ID, fileID string) {
+	t.Helper()
+
+	rec, ok := encodeRecord(blobID, fileID)
+	require.True(t, ok)
+
+	f, err := os.OpenFile(journalPath, os.O_WRONLY|os.O_APPEND, cacheFileMode)
+	require.NoError(t, err)
+
+	defer f.Close() //nolint:errcheck
+
+	_, err = f.Write(rec)
+	require.NoError(t, err)
+}
+
+// TestPersistentIDCacheRescanTail covers the incremental tail read that the
+// read path uses to recover a blob another process on this machine wrote.
+func TestPersistentIDCacheRescanTail(t *testing.T) {
+	dir := t.TempDir()
+	c := newTestIDCache(t, dir, "folder-tail")
+
+	// A quiet journal reports no activity and finds nothing.
+	fileID, found, appended := c.RescanTail("elsewhere")
+	require.Empty(t, fileID)
+	require.False(t, found)
+	require.False(t, appended, "an unchanged journal is not evidence of a concurrent writer")
+
+	appendRawRecord(t, c.journalPath, "elsewhere", "file-from-another-process")
+
+	fileID, found, appended = c.RescanTail("elsewhere")
+	require.True(t, found)
+	require.Equal(t, "file-from-another-process", fileID)
+	require.True(t, appended)
+
+	// The mapping is now in memory, so an ordinary Get sees it.
+	got, ok := c.Get("elsewhere")
+	require.True(t, ok)
+	require.Equal(t, "file-from-another-process", got)
+
+	// ... and the region just read is not read again.
+	_, _, appended = c.RescanTail("elsewhere")
+	require.False(t, appended)
+
+	// A record about some other blob still counts as activity, which is what
+	// licenses the read path to re-query a lagging name index.
+	appendRawRecord(t, c.journalPath, "someone-else", "another-file")
+
+	_, found, appended = c.RescanTail("elsewhere-still-missing")
+	require.False(t, found)
+	require.True(t, appended)
+}
+
+// TestPersistentIDCacheRescanTailKeepsOurOwnWrites pins the merge rule: records
+// read from the tail never overwrite a mapping this process already holds,
+// because our in-memory map is newer than anything on disk (appends are
+// batched) and re-reading our own records must not revert it.
+func TestPersistentIDCacheRescanTailKeepsOurOwnWrites(t *testing.T) {
+	dir := t.TempDir()
+	c := newTestIDCache(t, dir, "folder-tail-merge")
+
+	c.Put("blob-a", "old-file")
+	c.flushNow()
+
+	c.Put("blob-a", "new-file")
+
+	_, _, appended := c.RescanTail("blob-a")
+	require.True(t, appended)
+
+	got, ok := c.Get("blob-a")
+	require.True(t, ok)
+	require.Equal(t, "new-file", got, "the tail scan must not revert a newer in-memory mapping")
+
+	// A tombstone from another process is likewise ignored for a blob we know:
+	// a stale ID is corrected by the 404-invalidates rule, which is cheaper than
+	// discarding a mapping we are still using.
+	appendRawRecord(t, c.journalPath, "blob-a", "")
+
+	_, _, appended = c.RescanTail("blob-a")
+	require.True(t, appended)
+
+	got, ok = c.Get("blob-a")
+	require.True(t, ok)
+	require.Equal(t, "new-file", got)
+}
+
+// TestPersistentIDCacheRescanTailAfterCompaction covers the case where the
+// journal this process was tracking has been replaced: the offsets are
+// meaningless, so the scan resynchronizes on the new file and reports the
+// replacement as activity rather than replaying it.
+func TestPersistentIDCacheRescanTailAfterCompaction(t *testing.T) {
+	dir := t.TempDir()
+	c := newTestIDCache(t, dir, "folder-tail-compaction")
+
+	c.Put("blob-a", "file-a")
+	c.flushNow()
+
+	_, _, appended := c.RescanTail("blob-a")
+	require.True(t, appended)
+
+	// Another process compacts the journal out from under us: it builds a
+	// replacement elsewhere and renames it over ours, which is what
+	// compactLocked does.
+	journal := journalPathFor(dir, "folder-tail-compaction")
+
+	replacement := newTestIDCache(t, filepath.Join(dir, "other-process"), "folder-tail-compaction")
+	replacement.Put("blob-c", "file-c")
+	replacement.flushNow()
+
+	rebuilt, err := os.ReadFile(replacement.journalPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(journal+".tmp", rebuilt, cacheFileMode))
+	require.NoError(t, os.Rename(journal+".tmp", journal))
+
+	_, found, appended := c.RescanTail("blob-c")
+	require.False(t, found, "a replaced journal is resynchronized, not replayed")
+	require.True(t, appended, "the replacement itself is write activity")
+
+	// Records appended to the NEW file are picked up normally from there on.
+	appendRawRecord(t, journal, "blob-d", "file-d")
+
+	fileID, found, appended := c.RescanTail("blob-d")
+	require.True(t, found)
+	require.Equal(t, "file-d", fileID)
+	require.True(t, appended)
+}
+
 func TestPersistentIDCacheMultiProcess(t *testing.T) {
 	exe, err := os.Executable()
 	require.NoError(t, err)

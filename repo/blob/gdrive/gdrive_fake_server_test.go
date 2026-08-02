@@ -3,13 +3,17 @@
 package gdrive
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
 	"slices"
 	"sort"
@@ -60,6 +64,15 @@ type fakeDrive struct {
 
 	// requests counts handled requests per method key.
 	requests map[string]int
+
+	// inFlight and peakInFlight track how many requests of a method are being
+	// handled at once, which is how the backend's concurrency ceiling is
+	// observed.
+	inFlight     map[string]int
+	peakInFlight map[string]int
+
+	// lastListQuery is the `q` parameter of the most recent files.list.
+	lastListQuery string
 
 	// userAgent is the User-Agent of the most recent request.
 	userAgent string
@@ -118,6 +131,8 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 		failures:     map[string][]fakeFailure{},
 		hooks:        map[string][]func(){},
 		requests:     map[string]int{},
+		inFlight:     map[string]int{},
+		peakInFlight: map[string]int{},
 	}
 
 	d.files[d.rootFolderID] = &fakeFile{
@@ -182,6 +197,22 @@ func (d *fakeDrive) requestCount(method string) int {
 	return d.requests[method]
 }
 
+// peakConcurrency reports the largest number of requests of one method the fake
+// ever handled simultaneously.
+func (d *fakeDrive) peakConcurrency(method string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.peakInFlight[method]
+}
+
+func (d *fakeDrive) listQuery() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.lastListQuery
+}
+
 // addFile injects a file directly, simulating another writer.
 func (d *fakeDrive) addFile(name string, content []byte, createdTime time.Time) string {
 	d.mu.Lock()
@@ -244,6 +275,15 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d.requests[method]++
 	d.userAgent = r.UserAgent()
 
+	d.inFlight[method]++
+	d.peakInFlight[method] = max(d.peakInFlight[method], d.inFlight[method])
+
+	defer func() {
+		d.mu.Lock()
+		d.inFlight[method]--
+		d.mu.Unlock()
+	}()
+
 	var hook func()
 
 	if h := d.hooks[method]; len(h) > 0 {
@@ -268,6 +308,8 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case r.URL.Path == "/batch/drive/v3":
+		d.handleBatch(w, r)
 	case r.URL.Path == "/drive/v3/about":
 		d.handleAbout(w, r)
 	case r.URL.Path == "/upload/drive/v3/files":
@@ -334,11 +376,138 @@ func (d *fakeDrive) handleFilesItem(w http.ResponseWriter, r *http.Request, file
 }
 
 //
+// ------------------------------------------------------------------- batch
+//
+
+// handleBatch implements the homogeneous batch endpoint: a multipart/mixed body
+// whose parts are complete HTTP requests, answered by a multipart/mixed body
+// whose parts are complete HTTP responses, each with its own status.
+//
+// Every inner request is routed back through ServeHTTP, so a part is handled by
+// exactly the same code (and counted, and subject to the same injected
+// failures) as the standalone call would have been. That is what lets a test
+// build a batch of mixed outcomes.
+func (d *fakeDrive) handleBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeDriveError(w, http.StatusMethodNotAllowed, "badRequest", "unsupported method "+r.Method)
+		return
+	}
+
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "multipart/mixed" {
+		writeDriveError(w, http.StatusBadRequest, "badRequest",
+			"a batch request must carry a multipart/mixed body, got "+r.Header.Get("Content-Type"))
+
+		return
+	}
+
+	mr := multipart.NewReader(r.Body, params["boundary"])
+
+	var out bytes.Buffer
+
+	mw := multipart.NewWriter(&out)
+
+	parts := 0
+
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			writeDriveError(w, http.StatusBadRequest, "badRequest", "unreadable batch part: "+err.Error())
+			return
+		}
+
+		if got := part.Header.Get("Content-Type"); got != batchPartContentType {
+			writeDriveError(w, http.StatusBadRequest, "badRequest", "a batch part must be "+batchPartContentType+", got "+got)
+			return
+		}
+
+		if err := d.handleBatchPart(mw, part, part.Header.Get("Content-ID")); err != nil {
+			writeDriveError(w, http.StatusBadRequest, "badRequest", err.Error())
+			return
+		}
+
+		parts++
+	}
+
+	if parts == 0 || parts > maxBatchDeleteSize {
+		writeDriveError(w, http.StatusBadRequest, "badRequest",
+			fmt.Sprintf("a batch request must hold between 1 and %v calls, got %v", maxBatchDeleteSize, parts))
+
+		return
+	}
+
+	mw.Close() //nolint:errcheck
+
+	w.Header().Set("Content-Type", "multipart/mixed; boundary="+mw.Boundary())
+	w.WriteHeader(http.StatusOK)
+	w.Write(out.Bytes()) //nolint:errcheck
+}
+
+func (d *fakeDrive) handleBatchPart(mw *multipart.Writer, part *multipart.Part, contentID string) error {
+	inner, err := http.ReadRequest(bufio.NewReader(part))
+	if err != nil {
+		return errors.Wrap(err, "unparseable batch part")
+	}
+
+	if strings.HasPrefix(inner.RequestURI, "http://") || strings.HasPrefix(inner.RequestURI, "https://") {
+		return errors.Errorf("full URLs are not allowed in batch requests, got %q", inner.RequestURI)
+	}
+
+	rec := httptest.NewRecorder()
+
+	d.ServeHTTP(rec, inner)
+
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Type", batchPartContentType)
+	h.Set("Content-ID", "<"+batchResponsePrefix+strings.Trim(contentID, "<>")+">")
+
+	pw, err := mw.CreatePart(h)
+	if err != nil {
+		return errors.Wrap(err, "unable to write a batch response part")
+	}
+
+	_, err = pw.Write(rawHTTPResponse(rec))
+
+	return errors.Wrap(err, "unable to write a batch response part")
+}
+
+// rawHTTPResponse renders a recorded response in HTTP/1.1 wire format, which is
+// what a batch response part holds.
+func rawHTTPResponse(rec *httptest.ResponseRecorder) []byte {
+	var sb bytes.Buffer
+
+	fmt.Fprintf(&sb, "HTTP/1.1 %d %s\r\n", rec.Code, http.StatusText(rec.Code))
+
+	for _, k := range slices.Sorted(maps.Keys(rec.Header())) {
+		for _, v := range rec.Header()[k] {
+			fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
+		}
+	}
+
+	if rec.Body.Len() > 0 {
+		fmt.Fprintf(&sb, "Content-Length: %d\r\n", rec.Body.Len())
+	}
+
+	sb.WriteString("\r\n")
+	sb.Write(rec.Body.Bytes())
+
+	return sb.Bytes()
+}
+
+//
 // -------------------------------------------------------------- files.list
 //
 
 func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+
+	d.mu.Lock()
+	d.lastListQuery = q.Get("q")
+	d.mu.Unlock()
 
 	parsed, err := parseFakeQuery(q.Get("q"))
 	if err != nil {
@@ -411,7 +580,17 @@ func (d *fakeDrive) matchingFilesLocked(q fakeQuery) []*fakeFile {
 	for _, f := range d.files {
 		switch {
 		case !slices.Contains(f.parents, q.parent):
-		case q.hasName && f.name != q.name:
+
+		// Drive's `=` is case-insensitive (RECON.md B.5.3). Modeling that here is
+		// what proves the backend's client-side exact-name filter is load-bearing.
+		case q.hasName && !strings.EqualFold(f.name, q.name):
+
+		// `contains` is modeled as a plain substring match, i.e. the WEAKEST
+		// semantics Drive's documentation can be read as promising, so that a
+		// backend relying on it for correctness rather than for narrowing fails
+		// here.
+		case q.hasNameContains && !strings.Contains(f.name, q.nameContains):
+
 		case q.hasMimeType && f.mimeType != q.mimeType:
 		case q.trashedFalse && f.trashed:
 		default:
@@ -1007,15 +1186,19 @@ type fakeQuery struct {
 	name    string
 	hasName bool
 
+	nameContains    string
+	hasNameContains bool
+
 	mimeType    string
 	hasMimeType bool
 
 	trashedFalse bool
 }
 
-// parseFakeQuery understands exactly the two `q` shapes the backend emits:
+// parseFakeQuery understands exactly the three `q` shapes the backend emits:
 //
 //	'<parent>' in parents and mimeType = '<mime>' and trashed = false
+//	'<parent>' in parents and mimeType = '<mime>' and trashed = false and name contains '<prefix>'
 //	'<parent>' in parents and name = '<name>' and mimeType = '<mime>' and trashed = false
 //
 // Anything else is rejected so that a change in the backend's query building
@@ -1046,6 +1229,14 @@ func parseFakeQuery(q string) (fakeQuery, error) {
 			}
 
 			res.name, res.hasName = v, true
+
+		case strings.HasPrefix(term, "name contains "):
+			v, err := unquoteDriveLiteral(strings.TrimPrefix(term, "name contains "))
+			if err != nil {
+				return res, err
+			}
+
+			res.nameContains, res.hasNameContains = v, true
 
 		case strings.HasPrefix(term, "mimeType = "):
 			v, err := unquoteDriveLiteral(strings.TrimPrefix(term, "mimeType = "))

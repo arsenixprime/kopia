@@ -4,11 +4,20 @@
 package gdrive
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +31,7 @@ import (
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/internal/iocopy"
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/blob/gdrive/gdriveerr"
 	"github.com/kopia/kopia/repo/blob/gdrive/gdrivepacer"
 	"github.com/kopia/kopia/repo/logging"
 )
@@ -59,31 +69,101 @@ const (
 	// defaultListPageSize is the files.list page size; 1000 is the API maximum.
 	defaultListPageSize = 1000
 
+	// defaultDeleteParallelism bounds how many delete requests this connection
+	// keeps in flight. Kopia's own fan-out (blob.DeleteMultiple, called by epoch
+	// maintenance and the list cache) chooses its own parallelism - four for
+	// epoch cleanup, one per prefix for the list cache - and nothing stops a
+	// future caller from choosing hundreds. This is the backend's own ceiling:
+	// the pacer already limits the RATE, but not the number of simultaneously
+	// open connections, and Drive is happier with a handful of reused ones than
+	// with a burst of new TLS handshakes.
+	defaultDeleteParallelism = 8
+
 	// bytesPerMB converts the megabyte-denominated tuning knobs.
 	bytesPerMB = 1 << 20
 )
 
-// Name-resolution retry budget.
+// Batched deletes (Options.Tuning.UseBatchDelete).
+const (
+	// maxBatchDeleteSize is Drive's documented hard limit: "You're limited to 100
+	// calls in a single batch request." (RECON.md C.1). More than that "might
+	// cause an error".
+	maxBatchDeleteSize = 100
+
+	// deleteBatchWindow is how long the goroutine assembling a batch waits for
+	// company before sending what it has. It is a latency/coalescing trade: a
+	// delete issued on its own pays the whole window before anything happens,
+	// which is why batching is opt-in. Kopia only ever deletes blobs in bulk
+	// (maintenance, epoch cleanup, GC), so in the workloads that matter the
+	// window is filled long before it expires.
+	deleteBatchWindow = 20 * time.Millisecond
+
+	// batchAPIPath is the Drive-specific homogeneous batch endpoint, relative to
+	// the API root. The global /batch endpoint was retired in 2019; the
+	// per-API one is current and carries no deprecation notice (RECON.md C.1).
+	batchAPIPath = "batch/drive/v3"
+
+	// drivePathSuffix is the trailing path of drive.Service.BasePath, which the
+	// batch endpoint replaces.
+	drivePathSuffix = "drive/v3/"
+
+	// batchPartContentType is the media type every part of a batch body carries.
+	batchPartContentType = "application/http"
+
+	// batchContentIDPrefix namespaces the Content-ID headers that tie a response
+	// part back to the request part it answers. Drive echoes "<response-ID>".
+	batchContentIDPrefix = "kopia-"
+	batchResponsePrefix  = "response-"
+)
+
+// Name-resolution miss protocol.
 //
 // A blob is addressed by Drive file NAME, and Drive's name index is eventually
 // consistent: a files.list query can miss a file that files.get would happily
 // return. The persistent blobID->fileID cache (gdrive_fileids.go) removes this
-// problem for anything this machine wrote, because the cached ID is resolved
-// with files.get. What remains is a blob written by ANOTHER process or machine,
-// where only a name query can find it. For those, a read escalates its query
-// instead of declaring the blob missing after a single miss - the previous
-// implementation gave up after 3 attempts, 300 ms in total, which is issue
-// #4272.
+// problem for anything this PROCESS wrote, and its process-wide registry
+// removes it for every other connection in the process - which is what fixes
+// the five-connection scenario of issue #4272, where "kopia repository
+// validate-provider" reads through one connection what another just wrote.
 //
-// These are deliberately package constants rather than Options.Tuning knobs:
-// Contract 5 does not include them, and they trade latency on a genuinely
-// missing blob (which Kopia treats as an ordinary, expected outcome) against
-// robustness on a lagging index. Six queries spread over five seconds is the
-// documented compromise.
+// What is left is a blob written by another PROCESS or another MACHINE. The two
+// are not equally expensive to cover:
+//
+//   - Another process on this machine shares the cache journal, so its writes
+//     are recoverable by re-reading the journal tail: a local file read, no
+//     round trip, no rate-limit budget. That is the first thing a miss does.
+//   - Another machine can only be caught by re-querying the name index, which
+//     costs a 100-quota-unit call and real latency, and is worth doing only
+//     when there is reason to believe a write happened recently.
+//
+// So a miss escalates to the network only when the journal tail shows that
+// somebody has been writing to this repository since we last looked. Otherwise
+// - the overwhelmingly common case, an honestly absent blob, which Kopia treats
+// as an ordinary expected outcome and asks about constantly - the answer comes
+// back after one confirming query instead of after six queries spread over five
+// seconds. Live evidence from the WP-2c validation run is that the escalation
+// never fired at all, while the budget was charged to every absent-blob lookup.
+//
+// PutBlob deliberately does not use this protocol: resolveFileIDForWrite treats
+// a miss as "absent" immediately and lets the duplicate-resolution protocol
+// clean up after a wrong guess, because making every overwrite wait would be
+// far worse than an occasional extra file. The create-retry path inside
+// uploadNewFile likewise re-queries directly (listNewestByName), because there
+// it is looking for a file it has just written itself.
+//
+// These are package constants rather than Options.Tuning knobs: Contract 5 does
+// not include them.
 const (
+	// nameQueryRetryInitialDelay is the first escalation step, and also the pause
+	// before the single confirming query.
 	nameQueryRetryInitialDelay = 100 * time.Millisecond
-	nameQueryRetryMaxDelay     = 2 * time.Second
-	nameQueryRetryBudget       = 5 * time.Second
+
+	// nameQueryRetryMaxDelay caps one escalation step.
+	nameQueryRetryMaxDelay = 1 * time.Second
+
+	// nameQueryRetryBudget bounds the whole escalation, and only applies when
+	// the journal showed concurrent write activity.
+	nameQueryRetryBudget = 2 * time.Second
 )
 
 // Field masks. Drive charges for, and Kopia pays for, every field it does not
@@ -104,9 +184,43 @@ const (
 	// blob.Metadata needs, so that GetMetadata never needs a second call.
 	nameLookupMetadataFields = "files(id,name,size,modifiedTime,createdTime)"
 
-	// listFields is the ListBlobs page mask.
-	listFields = "nextPageToken,files(id,name,size,modifiedTime,createdTime)"
+	// listFields is the ListBlobs page mask. createdTime is deliberately absent:
+	// the ordering that lets duplicates be collapsed is applied server-side by
+	// orderBy, so the value itself is never read, and rclone's rule of never
+	// requesting a field speculatively (RECON.md B.5.2) applies to a call that
+	// runs once per thousand blobs in the repository.
+	listFields = "nextPageToken,files(id,name,size,modifiedTime)"
 )
+
+// Server-side prefix narrowing.
+//
+// ListBlobs is given a prefix, and Drive can filter on it with `name contains`.
+// Two facts bound how useful that is:
+//
+//   - `contains` is documented as a substring match, not a prefix match, so it
+//     can only ever be a NARROWING hint; the client-side prefix filter stays as
+//     the correctness backstop. (Google's docs state that `contains` on `name`
+//     matches from the start of the value, but the guarantee is not worded
+//     strongly enough to make correctness depend on it.)
+//   - Most of Kopia's prefixes are one or two characters (`p`, `q`, `s`, `n`,
+//     `m`, `l`, `x`, `xe`, `xn`, `xr`, `xs`, `xw`) and select a large fraction
+//     of the repository, so narrowing on them buys nothing and costs a term in
+//     every query.
+//
+// But a real minority of call sites do use long prefixes, and for those the
+// difference is between reading one page and paging through the entire
+// repository:
+//
+//	xn<epoch>_                internal/epoch/epoch_manager.go:647,1055,1099
+//	kopia.repository          repo/maintenance/blob_retain.go:93
+//	kopia.blobcfg             repo/maintenance/blob_retain.go:93
+//	kopia.repository.backup.  repo/format/upgrade_lock.go:142
+//	_log_                     repo/maintenance/cleanup_logs.go:58, cli/command_logs_session.go:73
+//	<full blob ID>            repo/format/format_blob.go:91
+//	z<uuid>                   internal/providervalidation/providervalidation.go:483,491
+//
+// so narrowing is applied unconditionally above the length threshold.
+const minPrefixNarrowingLength = 4
 
 const (
 	// nameProbePageSize is the page size of a name lookup: one result is the
@@ -151,6 +265,8 @@ type resolvedTuning struct {
 	uploadChunkSize    int
 	simpleUploadCutoff int64
 	listPageSize       int64
+	deleteParallelism  int
+	useBatchDelete     bool
 	cacheDir           string
 }
 
@@ -170,6 +286,19 @@ type gdriveStorage struct {
 	pacer   *gdrivepacer.Pacer
 	stats   *TransportStats
 	idCache *persistentIDCache
+
+	// deleteSem bounds the number of delete requests in flight at once; see
+	// defaultDeleteParallelism.
+	deleteSem chan struct{}
+
+	// batchURL is the absolute URL of the homogeneous batch endpoint, derived
+	// from the service's base path so that the test seam's endpoint override is
+	// honored. Empty unless batching is enabled.
+	batchURL string
+
+	// deleteBatch coalesces concurrent deletes into batch requests. nil unless
+	// Options.Tuning.UseBatchDelete is set.
+	deleteBatch *deleteCollector
 
 	closeOnce sync.Once
 }
@@ -224,6 +353,19 @@ func New(ctx context.Context, opt *Options, isCreate bool) (blob.Storage, error)
 		stats:      stats,
 		pacer:      gdrivepacer.New(tuning.pacer, stats),
 		idCache:    idCache,
+		deleteSem:  make(chan struct{}, tuning.deleteParallelism),
+	}
+
+	if tuning.useBatchDelete {
+		batchURL, err := batchEndpoint(service.BasePath)
+		if err != nil {
+			s.Close(ctx) //nolint:errcheck
+
+			return nil, err
+		}
+
+		s.batchURL = batchURL
+		s.deleteBatch = newDeleteCollector(s)
 	}
 
 	if err := s.verifyConnection(ctx); err != nil {
@@ -291,7 +433,13 @@ func resolveTuning(opt *Options) resolvedTuning {
 		uploadChunkSize:    valueOrDefault(t.UploadChunkSizeMB, defaultUploadChunkSizeMB) * bytesPerMB,
 		simpleUploadCutoff: int64(valueOrDefault(t.SimpleUploadCutoffMB, defaultSimpleUploadCutoffMB)) * bytesPerMB,
 		listPageSize:       int64(valueOrDefault(t.ListPageSize, defaultListPageSize)),
-		cacheDir:           t.CacheDir,
+		deleteParallelism:  valueOrDefault(t.DeleteParallelism, defaultDeleteParallelism),
+
+		// nil means "let the backend decide", and the backend's decision - until
+		// Phase 3's A/B measurement says otherwise - is the simpler path.
+		useBatchDelete: t.UseBatchDelete != nil && *t.UseBatchDelete,
+
+		cacheDir: t.CacheDir,
 	}
 
 	if res.cacheDir == "" {
@@ -509,14 +657,19 @@ func (s *gdriveStorage) GetMetadata(ctx context.Context, blobID blob.ID) (blob.M
 		s.idCache.Delete(blobID)
 	}
 
-	f, err := s.lookupFileByNameWithRetry(ctx, methodFilesList, blobID, nameLookupMetadataFields)
+	ref, err := s.resolveBlobFile(ctx, methodFilesList, blobID, nameLookupMetadataFields)
 	if err != nil {
 		return blob.Metadata{}, err
 	}
 
-	s.idCache.Put(blobID, f.Id)
+	if ref.file == nil {
+		// Resolved from the local journal, which knows the ID and nothing else.
+		return s.getMetadataByFileID(ctx, blobID, ref.fileID)
+	}
 
-	return parseFileMetadata(f, blobID)
+	s.idCache.Put(blobID, ref.file.Id)
+
+	return parseFileMetadata(ref.file, blobID)
 }
 
 func (s *gdriveStorage) getMetadataByFileID(ctx context.Context, blobID blob.ID, fileID string) (blob.Metadata, error) {
@@ -757,6 +910,17 @@ func (s *gdriveStorage) resolveCreateRace(ctx context.Context, blobID blob.ID, c
 	return blob.ErrBlobAlreadyExists
 }
 
+// DeleteBlob removes one blob.
+//
+// Kopia has no bulk-delete entry point in blob.Storage: maintenance deletes
+// large sets through blob.DeleteMultiple (repo/blob/storage.go:368), which is
+// nothing more than this method called from a bounded pool of goroutines. So
+// the cost of deleting N blobs is decided here, one blob at a time, and the
+// whole of it is the single files.delete this reaches on a cache hit - no
+// verification read before it and no name query after it. Concurrency is
+// bounded by deleteSem and paced by the pacer, both of which are shared by
+// every caller of this method, so an aggressive fan-out above cannot turn into
+// an aggressive fan-out on the wire.
 func (s *gdriveStorage) DeleteBlob(ctx context.Context, blobID blob.ID) error {
 	defer lockBlob(s.folderID, blobID)()
 
@@ -816,15 +980,547 @@ func (s *gdriveStorage) DeleteBlob(ctx context.Context, blobID blob.ID) error {
 // still count against Drive's 500,000-items-per-folder and per-Shared-Drive
 // limits, so a repository that trashed its blobs would eventually refuse writes
 // while appearing to have deleted them (RECON.md C.4).
+//
+// With batching enabled this hands the file to the collector, which merges it
+// with whatever other deletes are in flight; otherwise it is one request.
+// Either way the concurrency ceiling and the pacer apply.
 func (s *gdriveStorage) deleteFileByID(ctx context.Context, blobID blob.ID, fileID string) error {
+	if s.deleteBatch != nil {
+		return s.deleteBatch.delete(ctx, blobID, fileID)
+	}
+
+	return s.deleteFileByIDNow(ctx, blobID, fileID)
+}
+
+// deleteFileByIDNow issues one files.delete, bypassing the collector.
+func (s *gdriveStorage) deleteFileByIDNow(ctx context.Context, blobID blob.ID, fileID string) error {
+	release, err := s.acquireDeleteSlot(ctx)
+	if err != nil {
+		return err
+	}
+
+	defer release()
+
 	//nolint:wrapcheck // the pacer returns a *gdriveerr.DriveError that already names the operation, the blob and the Drive reason.
 	return s.pacer.Call(ctx, methodFilesDelete, string(blobID), func() error {
-		return s.files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
+		// Fields("") asks Drive for an empty response body. A delete answers 204
+		// with no content anyway, but saying so costs nothing and is what rclone
+		// does on the same call (RECON.md B.3.1).
+		return s.files.Delete(fileID).SupportsAllDrives(true).Fields("").Context(ctx).Do()
 	})
+}
+
+// acquireDeleteSlot takes one of the connection's delete slots, returning the
+// function that gives it back. It respects context cancellation while waiting.
+func (s *gdriveStorage) acquireDeleteSlot(ctx context.Context) (func(), error) {
+	select {
+	case s.deleteSem <- struct{}{}:
+		return func() { <-s.deleteSem }, nil
+
+	case <-ctx.Done():
+		//nolint:wrapcheck // context errors are propagated verbatim.
+		return nil, ctx.Err()
+	}
+}
+
+//
+// -------------------------------------------------------------- batch deletes
+//
+// Drive supports homogeneous batching: up to 100 sub-requests posted as one
+// multipart/mixed body to batch/drive/v3, each answered by its own part with
+// its own status (RECON.md C.1). It saves ROUND TRIPS ONLY - "a set of n
+// requests batched together counts toward your usage limit as n requests" - so
+// it is worth having exactly to the extent that a delete workload is
+// latency-bound rather than quota-bound, which is what Phase 3 measures. Until
+// then it is off by default and the default path is bounded-parallel singles.
+//
+// The Go client has no batch support, so the request is built by hand. There is
+// no aggregation point in blob.Storage to build a batch from - DeleteBlob is
+// synchronous and single-blob - so the batch is assembled from calls that are
+// ALREADY concurrent: a caller that finds no batch forming starts one, waits a
+// short window for company, and then sends and distributes the results. No
+// background goroutine, no flush timer, nothing to shut down: the work is
+// always done by a goroutine that was going to block on a delete anyway.
+//
+// FIRST LIVE MEASUREMENT (2026-08-01, 200 tiny blobs deleted through
+// blob.DeleteMultiple at DeleteParallelism=8, real Drive):
+//
+//	parallel singles, default pacer   10.3 s  (19.5 blobs/s), 200 requests
+//	batch,            default pacer   23.1 s  ( 8.6 blobs/s),  25 requests
+//	parallel singles, relaxed pacer    8.7 s  (23.0 blobs/s), 200 requests
+//	batch,            relaxed pacer   26.4 s  ( 7.6 blobs/s),  25 requests
+//
+// Batching LOST, by a factor of about 2.5, and the reason is structural rather
+// than incidental: Drive executes the sub-requests of a batch one after another,
+// so a batch of eight turns eight overlapping round trips into one round trip
+// containing eight serial server-side deletes (~0.93 s per batch of eight
+// against ~0.41 s for one delete with eight in flight). Coalescing only pays
+// when the caller's fan-out is much wider than the connection count, which for
+// blob.DeleteMultiple it never is. Phase 3 owns the final call; on this evidence
+// the knob to turn is DeleteParallelism, not UseBatchDelete.
+
+// deleteRequest is one blob's delete, waiting for its batch.
+type deleteRequest struct {
+	blobID blob.ID
+	fileID string
+
+	// ctx is the caller's own context, kept so that a request can be told apart
+	// from the batch it happened to travel in: the batch is issued under the
+	// context of whichever caller assembled it, and that caller giving up must
+	// not be reported to everybody else as their own cancellation.
+	ctx context.Context //nolint:containedctx
+
+	// done carries the final outcome to the waiting caller. Buffered, so the
+	// sender never blocks on a caller that has given up.
+	done chan error
+
+	// resolved and err are written only by the goroutine currently flushing the
+	// batch this request belongs to, and read only after that goroutine has
+	// handed the result over through done.
+	resolved bool
+	err      error
+}
+
+// deleteCollector coalesces concurrent deletes into batch requests.
+type deleteCollector struct {
+	s *gdriveStorage
+
+	window  time.Duration // test hook
+	maxSize int           // test hook
+
+	// full is signaled when pending reaches maxSize, so a batch that fills up
+	// early does not wait out the window.
+	full chan struct{}
+
+	mu sync.Mutex
+	// +checklocks:mu
+	pending []*deleteRequest
+	// +checklocks:mu
+	leading bool
+}
+
+func newDeleteCollector(s *gdriveStorage) *deleteCollector {
+	return &deleteCollector{
+		s:       s,
+		window:  deleteBatchWindow,
+		maxSize: maxBatchDeleteSize,
+		full:    make(chan struct{}, 1),
+	}
+}
+
+// delete enqueues one delete and blocks until it has been answered.
+//
+// A caller whose context is canceled while it waits stops waiting, but its
+// request stays in the batch: the delete may still happen, exactly as an
+// in-flight HTTP request may still be served after its caller walks away.
+func (c *deleteCollector) delete(ctx context.Context, blobID blob.ID, fileID string) error {
+	req := &deleteRequest{blobID: blobID, fileID: fileID, ctx: ctx, done: make(chan error, 1)}
+
+	c.mu.Lock()
+
+	c.pending = append(c.pending, req)
+	lead := !c.leading
+
+	if lead {
+		c.leading = true
+	}
+
+	if len(c.pending) >= c.maxSize {
+		postSignal(c.full)
+	}
+
+	c.mu.Unlock()
+
+	if lead {
+		c.lead(ctx)
+	}
+
+	select {
+	case err := <-req.done:
+		return err
+
+	case <-ctx.Done():
+		//nolint:wrapcheck // context errors are propagated verbatim.
+		return ctx.Err()
+	}
+}
+
+// lead assembles and sends batches until nothing is waiting, then resigns.
+//
+// Leadership is handed over under the same mutex that enqueues a request, so a
+// request can never be left in the queue with nobody to send it: either the
+// enqueue happens first and this loop picks it up, or the resignation happens
+// first and the enqueuing caller becomes the next leader.
+func (c *deleteCollector) lead(ctx context.Context) {
+	for {
+		c.mu.Lock()
+
+		if len(c.pending) == 0 {
+			c.leading = false
+
+			c.mu.Unlock()
+
+			return
+		}
+
+		c.mu.Unlock()
+
+		c.waitForBatch(ctx)
+
+		c.mu.Lock()
+
+		batch := c.pending
+		c.pending = nil
+
+		drainSignal(c.full)
+
+		c.mu.Unlock()
+
+		c.send(ctx, batch)
+	}
+}
+
+// waitForBatch blocks until the window expires, the batch fills up, or the
+// leader's own context is canceled.
+func (c *deleteCollector) waitForBatch(ctx context.Context) {
+	t := time.NewTimer(c.window)
+	defer t.Stop()
+
+	select {
+	case <-t.C:
+	case <-c.full:
+	case <-ctx.Done():
+	}
+}
+
+// send splits the collected requests into batch-sized chunks, executes them and
+// answers every waiter.
+func (c *deleteCollector) send(ctx context.Context, batch []*deleteRequest) {
+	for chunk := range slices.Chunk(batch, c.maxSize) {
+		if len(chunk) == 1 {
+			// A batch envelope around a single call is strictly more work than
+			// the call.
+			r := chunk[0]
+			r.err = c.s.deleteFileByIDNow(ctx, r.blobID, r.fileID)
+
+			continue
+		}
+
+		c.s.runDeleteBatch(ctx, chunk)
+	}
+
+	for _, r := range batch {
+		// The batch traveled under the assembling caller's context. If that
+		// caller walked away but this one did not, the delete still has to
+		// happen, so it is re-issued on its own.
+		if isContextError(r.err) && r.ctx.Err() == nil {
+			//nolint:contextcheck // r.ctx IS the caller's context; the point of this branch is that it is not the one the batch used.
+			r.err = c.s.deleteFileByIDNow(r.ctx, r.blobID, r.fileID)
+		}
+
+		r.done <- r.err
+	}
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// runDeleteBatch executes one batch, retrying through the pacer for as long as
+// any part remains unresolved.
+//
+// Per-part error semantics, which are the whole subtlety of batching:
+//
+//   - The envelope and the parts fail independently. A failed envelope means
+//     nothing was executed, so the entire batch is retried.
+//   - Every part carries its own status and is classified on its own through
+//     gdriveerr, so a 404 on one file and a success on the next are reported to
+//     their own callers and to nobody else.
+//   - A part whose classification is retryable - notably a 403 rateLimitExceeded
+//     or userRateLimitExceeded, which Drive can return for individual parts of an
+//     otherwise successful batch - is NOT resolved. One such error is returned to
+//     the pacer, which backs the WHOLE BACKEND off (that is what a rate limit
+//     means) and retries; the retry re-sends only the parts that are still
+//     unresolved, so a partially-successful batch is never re-executed.
+//   - When the pacer finally gives up, whatever is still unresolved fails with
+//     the classified error it last produced.
+func (s *gdriveStorage) runDeleteBatch(ctx context.Context, reqs []*deleteRequest) {
+	release, err := s.acquireDeleteSlot(ctx)
+	if err != nil {
+		setUnresolved(reqs, err)
+
+		return
+	}
+
+	defer release()
+
+	if err := s.pacer.Call(ctx, methodBatch, "", func() error {
+		return s.executeDeleteBatch(ctx, reqs)
+	}); err != nil {
+		setUnresolved(reqs, err)
+	}
+}
+
+// executeDeleteBatch posts one batch request holding every unresolved delete and
+// records the outcome of each part. It returns nil once every part has an
+// outcome, and otherwise an error suitable for the pacer to act on.
+func (s *gdriveStorage) executeDeleteBatch(ctx context.Context, reqs []*deleteRequest) error {
+	todo := unresolvedRequests(reqs)
+	if len(todo) == 0 {
+		return nil
+	}
+
+	body, contentType, err := buildDeleteBatchBody(s.service.BasePath, todo)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.batchURL, bytes.NewReader(body))
+	if err != nil {
+		return errors.Wrap(err, "unable to build the Google Drive batch request")
+	}
+
+	req.Header.Set("Content-Type", contentType)
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		//nolint:wrapcheck // the pacer classifies this error through gdriveerr.
+		return err
+	}
+
+	defer resp.Body.Close() //nolint:errcheck
+
+	// A non-2xx on the envelope itself means no part ran.
+	if err := googleapi.CheckResponse(resp); err != nil {
+		//nolint:wrapcheck // the pacer classifies this error through gdriveerr.
+		return err
+	}
+
+	return s.applyDeleteBatchResponse(ctx, resp, todo)
+}
+
+// applyDeleteBatchResponse decodes the multipart response and records each
+// part's outcome against its request.
+func (s *gdriveStorage) applyDeleteBatchResponse(ctx context.Context, resp *http.Response, todo []*deleteRequest) error {
+	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
+		return errors.Errorf("Google Drive answered a batch request with %q instead of a multipart body", resp.Header.Get("Content-Type"))
+	}
+
+	mr := multipart.NewReader(resp.Body, params["boundary"])
+
+	for i := 0; ; i++ {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			return errors.Wrap(err, "unable to read the Google Drive batch response")
+		}
+
+		target := matchBatchPart(todo, part.Header.Get("Content-ID"), i)
+
+		perr := readBatchPartResult(part, target)
+
+		part.Close() //nolint:errcheck
+
+		if target == nil {
+			continue
+		}
+
+		if perr == nil {
+			target.resolved, target.err = true, nil
+
+			continue
+		}
+
+		if d, _ := gdriveerr.DispositionOf(perr); d.Retryable() {
+			// Left unresolved on purpose: the pacer decides whether to send it
+			// again, and only the parts still in this state are re-sent.
+			target.err = perr
+
+			continue
+		}
+
+		target.resolved, target.err = true, perr
+	}
+
+	// Everything still unresolved goes back to the pacer as one representative
+	// error. Drive answers every part it was given, so a request with no part at
+	// all means a truncated body, which must not be mistaken for success.
+	var retryable error
+
+	for _, r := range todo {
+		if r.resolved {
+			continue
+		}
+
+		if r.err == nil {
+			r.err = errors.Errorf("Google Drive returned no batch response for blob %v", r.blobID)
+		}
+
+		retryable = r.err
+	}
+
+	if retryable != nil {
+		log(ctx).Debugf("retrying %v of %v Google Drive batch deletes: %v", countUnresolved(todo), len(todo), retryable)
+	}
+
+	return retryable
+}
+
+// readBatchPartResult parses one application/http part as an HTTP response and
+// returns its error, if any, classified through gdriveerr.
+func readBatchPartResult(part *multipart.Part, target *deleteRequest) error {
+	pr, err := http.ReadResponse(bufio.NewReader(part), nil)
+	if err != nil {
+		return errors.Wrap(err, "unable to parse a Google Drive batch response part")
+	}
+
+	defer pr.Body.Close() //nolint:errcheck
+
+	var blobID blob.ID
+	if target != nil {
+		blobID = target.blobID
+	}
+
+	// CheckResponse builds the same *googleapi.Error the generated client would
+	// have produced for this status and body, so a part is classified by exactly
+	// the same table as a standalone call.
+	//nolint:wrapcheck // Classify returns a *gdriveerr.DriveError that already names the operation, the blob and the Drive reason.
+	return gdriveerr.Classify(googleapi.CheckResponse(pr), methodFilesDelete, string(blobID))
+}
+
+// matchBatchPart finds the request a response part answers. Drive echoes the
+// request's Content-ID prefixed with "response-", and documents that parts come
+// back in request order; the header is authoritative and the position is the
+// fallback.
+func matchBatchPart(todo []*deleteRequest, contentID string, position int) *deleteRequest {
+	id := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(contentID), "<"), ">")
+	id = strings.TrimPrefix(id, batchResponsePrefix)
+
+	if n, err := strconv.Atoi(strings.TrimPrefix(id, batchContentIDPrefix)); err == nil && n >= 0 && n < len(todo) {
+		return todo[n]
+	}
+
+	if position < len(todo) {
+		return todo[position]
+	}
+
+	return nil
+}
+
+// buildDeleteBatchBody renders the multipart/mixed batch body. Inner requests
+// must carry path-only URLs ("full URLs are not allowed in batch requests"),
+// which is why the service's base path is needed here.
+func buildDeleteBatchBody(basePath string, reqs []*deleteRequest) (body []byte, contentType string, err error) {
+	base, err := url.Parse(basePath)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "unable to parse the Google Drive base path %q", basePath)
+	}
+
+	var buf bytes.Buffer
+
+	w := multipart.NewWriter(&buf)
+
+	for i, r := range reqs {
+		h := textproto.MIMEHeader{}
+		h.Set("Content-Type", batchPartContentType)
+		h.Set("Content-ID", fmt.Sprintf("<%s%d>", batchContentIDPrefix, i))
+
+		// binary keeps net/http's multipart writer from being tempted to
+		// re-encode the embedded request.
+		h.Set("Content-Transfer-Encoding", "binary")
+
+		p, err := w.CreatePart(h)
+		if err != nil {
+			return nil, "", errors.Wrap(err, "unable to build the Google Drive batch body")
+		}
+
+		target := *base
+		target.Path = base.Path + "files/" + r.fileID
+		target.RawQuery = url.Values{"supportsAllDrives": {"true"}, "fields": {""}}.Encode()
+
+		// A bare request line plus a blank line: no body, and no headers of its
+		// own - the envelope's Authorization applies to every part.
+		if _, err := fmt.Fprintf(p, "DELETE %s HTTP/1.1\r\n\r\n", target.RequestURI()); err != nil {
+			return nil, "", errors.Wrap(err, "unable to build the Google Drive batch body")
+		}
+	}
+
+	if err := w.Close(); err != nil {
+		return nil, "", errors.Wrap(err, "unable to build the Google Drive batch body")
+	}
+
+	return buf.Bytes(), "multipart/mixed; boundary=" + w.Boundary(), nil
+}
+
+// batchEndpoint derives the batch URL from the Drive service's base path, which
+// is "<root>/drive/v3/" in production and the fake server's address in tests.
+func batchEndpoint(basePath string) (string, error) {
+	u, err := url.Parse(basePath)
+	if err != nil {
+		return "", errors.Wrapf(err, "unable to parse the Google Drive base path %q", basePath)
+	}
+
+	root, ok := strings.CutSuffix(u.Path, drivePathSuffix)
+	if !ok {
+		return "", errors.Errorf("unable to derive the Google Drive batch endpoint from %q", basePath)
+	}
+
+	u.Path = root + batchAPIPath
+	u.RawQuery, u.Fragment = "", ""
+
+	return u.String(), nil
+}
+
+func unresolvedRequests(reqs []*deleteRequest) []*deleteRequest {
+	res := make([]*deleteRequest, 0, len(reqs))
+
+	for _, r := range reqs {
+		if !r.resolved {
+			res = append(res, r)
+		}
+	}
+
+	return res
+}
+
+func countUnresolved(reqs []*deleteRequest) int {
+	return len(unresolvedRequests(reqs))
+}
+
+func setUnresolved(reqs []*deleteRequest, err error) {
+	for _, r := range reqs {
+		if !r.resolved {
+			r.resolved, r.err = true, err
+		}
+	}
+}
+
+// postSignal posts to a capacity-one channel without blocking.
+func postSignal(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// drainSignal empties a capacity-one channel without blocking.
+func drainSignal(ch chan struct{}) {
+	select {
+	case <-ch:
+	default:
+	}
 }
 
 func (s *gdriveStorage) ListBlobs(ctx context.Context, prefix blob.ID, callback func(blob.Metadata) error) error {
 	q := fmt.Sprintf("%s and mimeType = '%s' and trashed = false", s.parentTerm(), blobMimeType)
+
+	if len(prefix) >= minPrefixNarrowingLength {
+		q += fmt.Sprintf(" and name contains '%s'", escapeQueryLiteral(string(prefix)))
+	}
 
 	var (
 		pageToken string
@@ -990,44 +1686,122 @@ func (s *gdriveStorage) withFileID(ctx context.Context, op string, blobID blob.I
 		s.idCache.Delete(blobID)
 	}
 
-	f, err := s.lookupFileByNameWithRetry(ctx, op, blobID, nameLookupFields)
+	ref, err := s.resolveBlobFile(ctx, op, blobID, nameLookupFields)
 	if err != nil {
 		return err
 	}
 
-	s.idCache.Put(blobID, f.Id)
+	if ref.file != nil {
+		s.idCache.Put(blobID, ref.file.Id)
+	}
 
-	return fn(f.Id)
+	return fn(ref.id())
 }
 
-// lookupFileByNameWithRetry resolves a blob name, re-querying with an escalating
-// delay before concluding that the blob does not exist. See the commentary on
-// nameQueryRetryBudget.
-func (s *gdriveStorage) lookupFileByNameWithRetry(ctx context.Context, op string, blobID blob.ID, fields string) (*drive.File, error) {
+// blobFileRef is what the miss protocol resolves a blob name to: either the
+// file the name index returned, carrying the requested fields, or nothing but
+// the file ID, recovered from the local cache journal.
+type blobFileRef struct {
+	file   *drive.File
+	fileID string
+}
+
+func (r blobFileRef) id() string {
+	if r.file != nil {
+		return r.file.Id
+	}
+
+	return r.fileID
+}
+
+// resolveBlobFile resolves a blob name to its Drive file, applying the miss
+// protocol documented at nameQueryRetryBudget: one query, then the local
+// journal, then - only if the journal shows somebody has been writing - an
+// escalating re-query, and otherwise a single confirming query.
+func (s *gdriveStorage) resolveBlobFile(ctx context.Context, op string, blobID blob.ID, fields string) (blobFileRef, error) {
+	f, err := s.lookupFileByName(ctx, op, blobID, fields)
+	if err == nil {
+		return blobFileRef{file: f}, nil
+	}
+
+	if !errors.Is(err, blob.ErrBlobNotFound) {
+		return blobFileRef{}, err
+	}
+
+	fileID, found, appended := s.idCache.RescanTail(blobID)
+	if found {
+		// Another process on this machine wrote it and recorded the file ID.
+		// files.get on that ID is authoritative and needs no name index at all.
+		log(ctx).Debugf("resolved blob %v from the Google Drive file ID journal after a name-index miss", blobID)
+
+		return blobFileRef{fileID: fileID}, nil
+	}
+
+	if !appended {
+		// Nothing has been written to this repository since we last looked, so
+		// there is no lagging index to wait for. One confirming query, then the
+		// answer the caller almost certainly expects.
+		return s.confirmMissing(ctx, op, blobID, fields, err)
+	}
+
+	return s.escalateMissing(ctx, op, blobID, fields, err)
+}
+
+// confirmMissing re-runs the name query once, after a short pause, and reports
+// the original not-found error if it misses again.
+func (s *gdriveStorage) confirmMissing(ctx context.Context, op string, blobID blob.ID, fields string, missErr error) (blobFileRef, error) {
+	if !clock.SleepInterruptibly(ctx, nameQueryRetryInitialDelay) {
+		//nolint:wrapcheck // context errors are propagated verbatim.
+		return blobFileRef{}, ctx.Err()
+	}
+
+	f, err := s.lookupFileByName(ctx, op, blobID, fields)
+	if err == nil {
+		return blobFileRef{file: f}, nil
+	}
+
+	if !errors.Is(err, blob.ErrBlobNotFound) {
+		return blobFileRef{}, err
+	}
+
+	return blobFileRef{}, missErr
+}
+
+// escalateMissing re-queries the name index with an escalating delay for up to
+// nameQueryRetryBudget, re-reading the cache journal on every round because a
+// concurrent local writer may record the file ID before Drive's index catches
+// up.
+func (s *gdriveStorage) escalateMissing(ctx context.Context, op string, blobID blob.ID, fields string, missErr error) (blobFileRef, error) {
 	var (
 		delay    = nameQueryRetryInitialDelay
 		deadline = clock.Now().Add(nameQueryRetryBudget)
 	)
 
 	for {
-		f, err := s.lookupFileByName(ctx, op, blobID, fields)
-		if err == nil || !errors.Is(err, blob.ErrBlobNotFound) {
-			return f, err
-		}
-
 		remaining := deadline.Sub(clock.Now())
 		if remaining <= 0 {
-			return nil, err
+			return blobFileRef{}, missErr
 		}
 
-		if delay > remaining {
-			delay = remaining
-		}
-
-		if !clock.SleepInterruptibly(ctx, delay) {
+		if !clock.SleepInterruptibly(ctx, min(delay, remaining)) {
 			//nolint:wrapcheck // context errors are propagated verbatim.
-			return nil, ctx.Err()
+			return blobFileRef{}, ctx.Err()
 		}
+
+		if fileID, found, _ := s.idCache.RescanTail(blobID); found {
+			return blobFileRef{fileID: fileID}, nil
+		}
+
+		f, err := s.lookupFileByName(ctx, op, blobID, fields)
+		if err == nil {
+			return blobFileRef{file: f}, nil
+		}
+
+		if !errors.Is(err, blob.ErrBlobNotFound) {
+			return blobFileRef{}, err
+		}
+
+		missErr = err
 
 		if delay *= 2; delay > nameQueryRetryMaxDelay {
 			delay = nameQueryRetryMaxDelay
@@ -1102,11 +1876,12 @@ func (s *gdriveStorage) listByName(ctx context.Context, op string, blobID blob.I
 }
 
 func (s *gdriveStorage) rawListByName(ctx context.Context, blobID blob.ID, fields string, pageSize int64) (*drive.FileList, error) {
-	q := fmt.Sprintf("%s and name = '%s' and mimeType = '%s' and trashed = false",
-		s.parentTerm(), escapeQueryLiteral(toFileName(blobID)), blobMimeType)
+	name := toFileName(blobID)
 
-	//nolint:wrapcheck // the pacer classifies this error through gdriveerr.
-	return s.files.List().
+	q := fmt.Sprintf("%s and name = '%s' and mimeType = '%s' and trashed = false",
+		s.parentTerm(), escapeQueryLiteral(name), blobMimeType)
+
+	res, err := s.files.List().
 		SupportsAllDrives(true).
 		IncludeItemsFromAllDrives(true).
 		Q(q).
@@ -1114,6 +1889,20 @@ func (s *gdriveStorage) rawListByName(ctx context.Context, blobID blob.ID, field
 		Fields(googleapi.Field(fields)).
 		Context(ctx).
 		Do()
+	if err != nil {
+		//nolint:wrapcheck // the pacer classifies this error through gdriveerr.
+		return nil, err
+	}
+
+	// Drive's `=` operator is CASE-INSENSITIVE (rclone re-checks the same way,
+	// RECON.md B.5.3), so a query for "abc" can return a file called "ABC".
+	// Kopia's blob IDs are case-sensitive, and a repository holding both would
+	// otherwise see one blob's bytes served for the other.
+	res.Files = slices.DeleteFunc(res.Files, func(f *drive.File) bool {
+		return f.Name != name
+	})
+
+	return res, nil
 }
 
 func (s *gdriveStorage) parentTerm() string {
