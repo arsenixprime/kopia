@@ -119,6 +119,21 @@ type WorkloadMetrics struct {
 	QuotaUnits       int64  `json:"quota_units"`
 	QuotaUnitsSource string `json:"quota_units_source"`
 
+	// PacedWaitMS is the total time this phase spent waiting for the pacer's
+	// steady-state token bucket - the pacer's error-free throttling, summed
+	// from Transport. It is 0 for every backend that is not the native Drive
+	// one, and 0 on a Drive workload that never outran the bucket, which is a
+	// measurement and not an absence: it is what falsifies a hypothesis about
+	// pacerMinSleepMS or pacerBurst.
+	PacedWaitMS float64 `json:"paced_wait_ms"`
+
+	// Params records the effective value of any workload parameter the harness
+	// resolved at run time instead of taking straight from config.params - a
+	// value config.params therefore cannot be trusted to report. Currently one
+	// key: "parallelism" on delete-sweep, which prefers the target's
+	// tuning.deleteParallelism over the harness's --parallelism.
+	Params map[string]int64 `json:"params,omitempty"`
+
 	// Transport is the native backend's Drive API counter delta for this
 	// workload, or null for any backend that is not the native Drive one.
 	Transport *gdrive.TransportStatsSnapshot `json:"transport_delta"`
@@ -167,7 +182,7 @@ type StatSummary struct {
 
 // metricNames are the per-workload metrics the comparison protocol understands,
 // in report order.
-var metricNames = []string{"wall_clock_ms", "p50_ms", "p90_ms", "p99_ms", "ops_per_sec", "errors", "bytes_up", "bytes_down", "quota_units"}
+var metricNames = []string{"wall_clock_ms", "p50_ms", "p90_ms", "p99_ms", "ops_per_sec", "errors", "bytes_up", "bytes_down", "quota_units", "paced_wait_ms"}
 
 // keyMetricNames are the metrics a baseline check regards as pass/fail signals.
 var keyMetricNames = []string{"wall_clock_ms", "p50_ms"}
@@ -205,6 +220,8 @@ func metricValue(m WorkloadMetrics, metric string) (float64, bool) {
 		return float64(m.BytesDown), true
 	case "quota_units":
 		return float64(m.QuotaUnits), true
+	case "paced_wait_ms":
+		return m.PacedWaitMS, true
 	default:
 		return 0, false
 	}
@@ -240,13 +257,50 @@ func readResult(path string) (*RunResult, error) {
 	return r, nil
 }
 
-// targetNames returns every target name that actually ran, sorted.
+// targetNames returns every target name that actually ran, **in configuration
+// order** - the order the targets file listed them, which `targets[]` preserves
+// (§2 of SCHEMA.md).
+//
+// This ordering is load-bearing, not cosmetic: compare treats the first series
+// as the reference, so the first target of the targets file is the control lane
+// and every delta reads "candidate relative to control". Sorting here (which is
+// what this did before WP-4b) silently inverted the sign of every delta for any
+// pair of lane names whose alphabetical order differs from their configured
+// one - `control` / `candidate` being exactly such a pair.
+//
+// A target that ran without appearing in `targets[]` can only come from a
+// hand-edited document, and is appended in execution order rather than dropped:
+// losing a series would be a worse failure than ordering it oddly.
 func (r *RunResult) targetNames() []string {
-	out := []string{}
+	ran := map[string]bool{}
+	executionOrder := []string{}
 
 	for _, t := range r.Trials {
-		out = append(out, t.Target)
+		if !ran[t.Target] {
+			ran[t.Target] = true
+
+			executionOrder = append(executionOrder, t.Target)
+		}
 	}
 
-	return dedupe(out)
+	out := []string{}
+	emitted := map[string]bool{}
+
+	for _, t := range r.Targets {
+		if ran[t.Name] && !emitted[t.Name] {
+			emitted[t.Name] = true
+
+			out = append(out, t.Name)
+		}
+	}
+
+	for _, n := range executionOrder {
+		if !emitted[n] {
+			emitted[n] = true
+
+			out = append(out, n)
+		}
+	}
+
+	return out
 }

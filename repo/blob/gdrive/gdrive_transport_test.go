@@ -405,6 +405,43 @@ func TestTransportStatsRecorderMethods(t *testing.T) {
 	}, snap.ErrorsByReason)
 }
 
+func TestTransportStatsRecordPacedWait(t *testing.T) {
+	stats := NewTransportStats()
+
+	stats.RecordPacedWait(methodFilesList, 120*time.Millisecond)
+	stats.RecordPacedWait(methodFilesList, 80*time.Millisecond)
+	stats.RecordPacedWait(methodFilesDelete, 250*time.Millisecond)
+
+	// A call that did not have to wait is not evidence of pacing: neither the
+	// count nor the duration may move.
+	stats.RecordPacedWait(methodFilesGet, 0)
+	stats.RecordPacedWait(methodFilesGet, -time.Second)
+
+	snap := stats.Snapshot()
+
+	require.Equal(t, int64(2), snap.PerMethod[methodFilesList].PacedWaits)
+	require.Equal(t, int64(200), snap.PerMethod[methodFilesList].PacedWaitMS)
+	require.Equal(t, int64(1), snap.PerMethod[methodFilesDelete].PacedWaits)
+	require.Equal(t, int64(250), snap.PerMethod[methodFilesDelete].PacedWaitMS)
+	require.NotContains(t, snap.PerMethod, methodFilesGet)
+
+	// The snapshot totals are the sums of the per-method counters.
+	require.Equal(t, int64(3), snap.PacedWaits)
+	require.Equal(t, int64(450), snap.PacedWaitMS)
+
+	// Paced waits are the error-free half of the pacer and must not leak into
+	// the backoff counters.
+	require.Zero(t, snap.PerMethod[methodFilesList].Backoffs)
+	require.Zero(t, snap.PerMethod[methodFilesList].BackoffMS)
+	require.Empty(t, snap.ErrorsByReason)
+
+	stats.Reset()
+
+	after := stats.Snapshot()
+	require.Zero(t, after.PacedWaits)
+	require.Zero(t, after.PacedWaitMS)
+}
+
 func TestTransportStatsSeparatesPacerAndHTTPReasons(t *testing.T) {
 	cli, stats, base := newTransportTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -458,6 +495,7 @@ func TestTransportStatsSnapshotJSONRoundTrip(t *testing.T) {
 	doTransportRequestAndDrain(t, cli, http.MethodGet, base+"/drive/v3/files")
 	stats.RecordError(methodFilesList, "some_reason")
 	stats.RecordBackoff(methodFilesList, 3*time.Second)
+	stats.RecordPacedWait(methodFilesList, 150*time.Millisecond)
 
 	snap := stats.Snapshot()
 
@@ -476,6 +514,10 @@ func TestTransportStatsSnapshotJSONRoundTrip(t *testing.T) {
 	// spot check the shape a benchmark harness relies on.
 	require.Equal(t, int64(10), decoded.PerMethod[methodFilesGetMedia].BytesDown)
 	require.Equal(t, int64(3000), decoded.PerMethod[methodFilesList].BackoffMS)
+	require.Equal(t, int64(1), decoded.PerMethod[methodFilesList].PacedWaits)
+	require.Equal(t, int64(150), decoded.PerMethod[methodFilesList].PacedWaitMS)
+	require.Equal(t, int64(1), decoded.PacedWaits)
+	require.Equal(t, int64(150), decoded.PacedWaitMS)
 	require.Len(t, decoded.PerMethod[methodFilesList].LatencyMS, len(decoded.LatencyBucketsMS)+1)
 }
 
@@ -529,6 +571,7 @@ func TestTransportConcurrentRoundTripAndSnapshot(t *testing.T) {
 				stats.RecordRetry(methodFilesList)
 				stats.RecordError(methodFilesGet, "classified")
 				stats.RecordBackoff(methodFilesGet, time.Millisecond)
+				stats.RecordPacedWait(methodFilesList, time.Millisecond)
 			}
 		}
 	})

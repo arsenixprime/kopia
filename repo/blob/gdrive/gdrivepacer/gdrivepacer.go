@@ -166,15 +166,27 @@ type Recorder interface {
 
 	// RecordBackoff is called once per delay actually slept, with its length.
 	RecordBackoff(op string, d time.Duration)
+
+	// RecordPacedWait is called once per steady-state token wait actually
+	// slept, with its length, and never with a zero or negative duration: a
+	// call that found a token waiting for it records nothing.
+	//
+	// This is the error-free half of the pacer, and it is the only way to tell
+	// a configuration in which Config.MinSleep binds from one in which the
+	// token bucket refills faster than the workload can draw from it. Without
+	// it a pacer hypothesis can only be argued from arithmetic (see the cycle-1
+	// entry of the tuning log), never measured.
+	RecordPacedWait(op string, d time.Duration)
 }
 
 // noopRecorder stands in for a nil Recorder so the hot path never has to test
 // for nil.
 type noopRecorder struct{}
 
-func (noopRecorder) RecordRetry(string)                  {}
-func (noopRecorder) RecordError(string, string)          {}
-func (noopRecorder) RecordBackoff(string, time.Duration) {}
+func (noopRecorder) RecordRetry(string)                    {}
+func (noopRecorder) RecordError(string, string)            {}
+func (noopRecorder) RecordBackoff(string, time.Duration)   {}
+func (noopRecorder) RecordPacedWait(string, time.Duration) {}
 
 // timeSource abstracts wall-clock reads and interruptible sleeps so that unit
 // tests can exercise the ladders without real delays.
@@ -323,7 +335,7 @@ func (p *Pacer) wait(ctx context.Context, op string) error {
 		return err
 	}
 
-	return p.waitForToken(ctx)
+	return p.waitForToken(ctx, op)
 }
 
 func (p *Pacer) waitForBackoff(ctx context.Context, op string) error {
@@ -344,7 +356,7 @@ func (p *Pacer) waitForBackoff(ctx context.Context, op string) error {
 	}
 }
 
-func (p *Pacer) waitForToken(ctx context.Context) error {
+func (p *Pacer) waitForToken(ctx context.Context, op string) error {
 	now := p.clk.Now()
 
 	r := p.limiter.ReserveN(now, 1)
@@ -363,6 +375,11 @@ func (p *Pacer) waitForToken(ctx context.Context) error {
 
 		return err //nolint:wrapcheck // Sleep only ever returns ctx.Err(), propagated verbatim
 	}
+
+	// Recorded AFTER the sleep, unlike RecordBackoff: a wait cut short by a
+	// canceled context was not actually paid, and a counter meant to prove
+	// whether MinSleep binds must not be inflated by one.
+	p.rec.RecordPacedWait(op, d)
 
 	return nil
 }

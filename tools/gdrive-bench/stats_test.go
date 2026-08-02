@@ -115,6 +115,62 @@ func TestDiffTransportStats(t *testing.T) {
 	require.Equal(t, int64(4*quReadItem+2*quListItems), quotaUnitsOfSnapshot(d))
 }
 
+func TestDiffTransportStatsCarriesPacedWaits(t *testing.T) {
+	before := gdrive.TransportStatsSnapshot{
+		SnapshotTime: time.Unix(100, 0).UTC(),
+		PerMethod: map[string]gdrive.MethodStats{
+			"files.delete": {Calls: 5, PacedWaits: 2, PacedWaitMS: 200},
+		},
+		PacedWaits:  2,
+		PacedWaitMS: 200,
+	}
+
+	after := gdrive.TransportStatsSnapshot{
+		SnapshotTime: time.Unix(160, 0).UTC(),
+		PerMethod: map[string]gdrive.MethodStats{
+			"files.delete":  {Calls: 20, PacedWaits: 14, PacedWaitMS: 1400},
+			"upload.simple": {Calls: 3, PacedWaits: 1, PacedWaitMS: 50},
+		},
+		PacedWaits:  15,
+		PacedWaitMS: 1450,
+	}
+
+	d := diffTransportStats(before, after)
+
+	require.Equal(t, int64(12), d.PerMethod["files.delete"].PacedWaits)
+	require.Equal(t, int64(1200), d.PerMethod["files.delete"].PacedWaitMS)
+	require.Equal(t, int64(1), d.PerMethod["upload.simple"].PacedWaits)
+
+	// The window totals are re-derived from the diffed methods, never carried
+	// over from the absolute snapshots.
+	require.Equal(t, int64(13), d.PacedWaits)
+	require.Equal(t, int64(1250), d.PacedWaitMS)
+}
+
+// TestPacedWaitReachesTheWorkloadMetric pins the whole path a pacer hypothesis
+// is read through: transport counters -> phase delta -> paced_wait_ms ->
+// compare.
+func TestPacedWaitReachesTheWorkloadMetric(t *testing.T) {
+	stats := gdrive.NewTransportStats()
+	stats.RecordPacedWait("files.delete", 300*time.Millisecond)
+	stats.RecordPacedWait("files.delete", 700*time.Millisecond)
+
+	delta := diffTransportStats(gdrive.TransportStatsSnapshot{}, stats.Snapshot())
+
+	m := WorkloadMetrics{Transport: &delta, PacedWaitMS: float64(delta.PacedWaitMS)}
+
+	v, ok := metricValue(m, "paced_wait_ms")
+	require.True(t, ok)
+	require.InDelta(t, 1000.0, v, 1e-9)
+	require.Contains(t, metricNames, "paced_wait_ms")
+
+	// A backend without Drive instrumentation reports 0 rather than nothing, so
+	// the metric is always comparable.
+	zero, ok := metricValue(WorkloadMetrics{}, "paced_wait_ms")
+	require.True(t, ok)
+	require.InDelta(t, 0.0, zero, 1e-9)
+}
+
 func TestMergeErrorsByReason(t *testing.T) {
 	dst := map[string]int64{"a": 1}
 	mergeErrorsByReason(dst, map[string]int64{"a": 2, "b": 3})

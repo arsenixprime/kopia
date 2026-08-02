@@ -186,6 +186,7 @@ func (s *sampler) finish(st blob.Storage) WorkloadMetrics {
 			}
 
 			m.Transport = &d
+			m.PacedWaitMS = float64(d.PacedWaitMS)
 			m.QuotaUnits = quotaUnitsOfSnapshot(d)
 			m.QuotaUnitsSource = quotaSourceObserved
 
@@ -212,7 +213,10 @@ func diffTransportStats(before, after gdrive.TransportStatsSnapshot) gdrive.Tran
 	}
 
 	for k, a := range after.PerMethod {
-		res.PerMethod[k] = diffMethodStats(before.PerMethod[k], a)
+		d := diffMethodStats(before.PerMethod[k], a)
+		res.PerMethod[k] = d
+		res.PacedWaits += d.PacedWaits
+		res.PacedWaitMS += d.PacedWaitMS
 	}
 
 	for k, a := range after.ErrorsByReason {
@@ -234,6 +238,8 @@ func diffMethodStats(before, after gdrive.MethodStats) gdrive.MethodStats {
 		BytesUp:      nonNegative(after.BytesUp - before.BytesUp),
 		BytesDown:    nonNegative(after.BytesDown - before.BytesDown),
 		BackoffMS:    nonNegative(after.BackoffMS - before.BackoffMS),
+		PacedWaits:   nonNegative(after.PacedWaits - before.PacedWaits),
+		PacedWaitMS:  nonNegative(after.PacedWaitMS - before.PacedWaitMS),
 		LatencySumMS: nonNegative(after.LatencySumMS - before.LatencySumMS),
 	}
 

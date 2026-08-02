@@ -815,11 +815,41 @@ func runDeleteSweep(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error)
 	st := e.storage()
 	s := newSampler(st)
 
-	for _, r := range deleteParallel(ctx, st, victims, e.params.Parallelism) {
+	parallelism := effectiveDeleteParallelism(e.tgt, e.params.Parallelism)
+
+	for _, r := range deleteParallel(ctx, st, victims, parallelism) {
 		s.observe(r.d, r.err)
 	}
 
-	return one("delete-sweep", s.finish(st)), s.failure("delete-sweep")
+	m := s.finish(st)
+	m.Params = map[string]int64{deleteSweepParallelismParam: int64(parallelism)}
+
+	return one("delete-sweep", m), s.failure("delete-sweep")
+}
+
+// deleteSweepParallelismParam is the key delete-sweep records its effective
+// parallelism under in WorkloadMetrics.Params.
+const deleteSweepParallelismParam = "parallelism"
+
+// effectiveDeleteParallelism decides how many deletes delete-sweep issues at
+// once: the TARGET's own tuning.deleteParallelism when it sets one, and the
+// harness's --parallelism otherwise.
+//
+// The target wins because otherwise a cycle sweeping deleteParallelism measures
+// nothing: the harness's own semaphore (default 8) is the tighter of the two
+// and clamps the backend knob out of the experiment, which is exactly what
+// happened to tuning cycle 1. The chosen value is recorded in the phase's
+// Params so the result document says which of the two was in force rather than
+// leaving a reader to infer it from config.params.
+//
+// The backend's own deleteSem still applies underneath; this only stops the
+// harness from being the binding constraint.
+func effectiveDeleteParallelism(t target, harnessParallelism int) int {
+	if n, ok := t.deleteParallelism(); ok {
+		return n
+	}
+
+	return harnessParallelism
 }
 
 // percentDivisor turns DeletePercent into a fraction.

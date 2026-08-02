@@ -110,7 +110,9 @@ var knobTable = map[string]knobMeta{
 	groupTuning + ".deleteParallelism": {
 		def: "8", hint: "1..32 concurrent deletes",
 		affects: []string{"delete-sweep"},
-		doc:     "Ceiling on concurrent delete calls held open by one connection.",
+		doc: "Ceiling on concurrent delete calls held open by one connection. Setting it also raises the delete-sweep workload's own parallelism to " +
+			"the same value (the harness would otherwise clamp it at --parallelism and the knob would measure nothing); the value actually used is " +
+			"recorded in the workload's params.parallelism.",
 	},
 	groupTuning + ".useBatchDelete": {
 		def: "false", hint: "true|false",
@@ -162,7 +164,14 @@ func harnessKnobs() []KnobInfo {
 		mk("seed", "int64", "0 (clock)", "any", "Random seed. Recorded in the result; reusing it reproduces the exact blob sizes, offsets and orderings.", []string{"small-write", "range-read"}),
 		mk("pack-size-mb", "int64", "20", "1..1024 MB", "Size of a pack-write blob, and of the pack the range reads come from.", []string{"pack-write", "range-read"}),
 		mk("small-write-n", "int", "100 (smoke: 10)", "10..1000", "Number of small blobs written by small-write.", []string{"small-write"}),
-		mk("parallelism", "int", "8", "1..64", "Bounded parallelism of delete-sweep and of every workload's cleanup.", []string{"delete-sweep"}),
+		mk("delete-sweep-n", "int", "100 (smoke: 10)", "10..1000",
+			"Blobs delete-sweep writes; it then deletes delete_percent of them. Raise it to make the measured phase long enough for a pacer knob to bind - "+
+				"at the default 100 the phase is ~2 s and draws fewer tokens than the burst pool holds.",
+			[]string{"delete-sweep"}),
+		mk("parallelism", "int", "8", "1..64",
+			"Bounded parallelism of every workload's cleanup, and of delete-sweep unless the target sets tuning.deleteParallelism, which takes precedence "+
+				"(see that knob). A run that changes it is not comparable to the standing baseline.",
+			[]string{"delete-sweep"}),
 		mk("daily-upload-fraction", "float64", "0.5", "0.01..1.0", "Fraction of Google's 750 GB/day/user upload cap the harness may spend in one UTC day before it refuses to start.", nil),
 		mk("true-cold", "bool", "false", "true|false",
 			"Delete the on-disk file ID journal between the warm and the cold metadata pass, so read-metadata:cold measures a machine that has "+

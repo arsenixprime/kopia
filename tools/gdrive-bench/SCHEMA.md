@@ -449,3 +449,80 @@ the default applies):
 | Field | Meaning |
 |---|---|
 | `kopia_exe` | the binary `snapshot-e2e` drove; omitted when the workload did not run |
+
+### 8.5 Comparison reference is **configuration order**, and `--reference`
+
+§6 says "every series after the first is compared against the first" and §2 says
+`targets[]` is in configuration order. Until WP-4b the two did not agree:
+`compare` sorted target names alphabetically and took the first, so a run whose
+lanes were named `control` and `candidate` was reported with **`candidate`** as
+the reference and every `delta_pct` inverted relative to what the targets file
+implied. The sort is gone.
+
+- The default reference is the **first target of the first result file, in the
+  order that file's `targets[]` lists them** — which is the order the targets
+  file listed them. With one file holding `control` then `candidate`, the
+  reference is `control` and every delta reads *candidate relative to control*.
+- `compare --reference=<name>` overrides it. `<name>` is a series key, or a
+  target name when that is unambiguous; an unknown or ambiguous name is refused
+  with exit 2 and the available keys are listed.
+- The report's `reference` field is unchanged in meaning and remains the
+  authority. A reader that already consulted it was always correct.
+- A target that appears in `trials[]` but not in `targets[]` (only possible in a
+  hand-edited document) is ordered last rather than dropped.
+
+`baseline check` is unaffected: it pairs same-named targets across two documents
+and always labels the reference `baseline:<target>`.
+
+### 8.6 Pacer steady-state wait instrumentation
+
+The pacer records the delays it makes calls sleep waiting for its **token
+bucket**, not just the ones it sleeps after an **error**. Without this a
+hypothesis about `pacerMinSleepMS` or `pacerBurst` can only be argued from
+arithmetic — the knob is inert unless the workload outruns the refill rate, and
+nothing measured whether it did.
+
+`transport_delta.perMethod[<method>]` (i.e. `gdrive.MethodStats`) gains:
+
+| Field | Meaning |
+|---|---|
+| `pacedWaits` | number of steady-state token waits this method actually paid. A call that found a token waiting for it counts 0 — not even the count moves. |
+| `pacedWaitMS` | their total length, in milliseconds |
+
+`transport_delta` itself (i.e. `gdrive.TransportStatsSnapshot`) gains the same
+two keys at top level, holding the sums over `perMethod`; `perMethod` remains
+the authority and the two always agree.
+
+Workload metrics (§3) gain:
+
+| Field | Meaning |
+|---|---|
+| `paced_wait_ms` | float; the phase's total steady-state pacer wait, taken from `transport_delta.pacedWaitMS`. `0` for every backend that is not the native Drive one, and `0` on a Drive phase that never outran the bucket — which is a **measurement**, not a missing value. |
+
+`paced_wait_ms` is also a compared metric (§6): lower is better, and a pacer
+cycle that shows `0` on both lanes has falsified its own hypothesis before
+looking at wall clock.
+
+Backoffs and paced waits never mix: `backoffs`/`backoffMS` remain the error
+path, `pacedWaits`/`pacedWaitMS` are the error-free one.
+
+### 8.7 `delete-sweep` size and effective parallelism
+
+- **`--delete-sweep-n`** sets `config.params.delete_sweep_n` the way
+  `--small-write-n` sets `small_write_n`. The default is unchanged (100; smoke
+  10), so no existing result changes meaning.
+- **`delete-sweep`'s parallelism now prefers the TARGET's
+  `tuning.deleteParallelism`** over the harness's `--parallelism`, falling back
+  to `--parallelism` when the target does not set one. Before, the harness's own
+  semaphore (default 8) was the tighter of the two and clamped the backend knob
+  out of every experiment that swept it.
+- Workload metrics gain an optional **`params`** object recording the values the
+  harness resolved at run time rather than reading straight from
+  `config.params`. One key exists today:
+
+| Key | Meaning |
+|---|---|
+| `params.parallelism` (on `delete-sweep`) | the number of concurrent deletes actually issued: the target's `tuning.deleteParallelism` when it set one, otherwise `config.params.parallelism` |
+
+  `params` is omitted entirely by workloads that resolve nothing, so its absence
+  means "`config.params` is the whole story".

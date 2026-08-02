@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -163,6 +164,66 @@ func buildSeries(files []string, results []*RunResult) []*seriesData {
 	return out
 }
 
+// selectReference moves the series named by ref to the front, so that
+// compareSeries uses it as the reference. An empty ref keeps the order
+// buildSeries produced, which is configuration order (see
+// RunResult.targetNames).
+//
+// ref is matched against a series key first and against a target name second,
+// because the two differ only when the same target appears in several input
+// files - and in that case naming the bare target is ambiguous and is refused
+// rather than guessed.
+func selectReference(series []*seriesData, ref string) ([]*seriesData, error) {
+	if ref == "" {
+		return series, nil
+	}
+
+	idx := -1
+
+	for i, s := range series {
+		if s.Key == ref {
+			idx = i
+			break
+		}
+	}
+
+	if idx < 0 {
+		matches := []int{}
+
+		for i, s := range series {
+			if s.Target == ref {
+				matches = append(matches, i)
+			}
+		}
+
+		switch len(matches) {
+		case 0:
+			return nil, errors.Errorf("no series named %q; available: %v", ref, strings.Join(seriesKeys(series), ", "))
+		case 1:
+			idx = matches[0]
+		default:
+			return nil, errors.Errorf("%q names %v series; use one of the unambiguous keys: %v", ref, len(matches), strings.Join(seriesKeys(series), ", "))
+		}
+	}
+
+	out := make([]*seriesData, 0, len(series))
+	out = append(out, series[idx])
+	out = append(out, series[:idx]...)
+	out = append(out, series[idx+1:]...)
+
+	return out, nil
+}
+
+// seriesKeys lists the series keys, for error messages.
+func seriesKeys(series []*seriesData) []string {
+	out := make([]string, 0, len(series))
+	for _, s := range series {
+		out = append(out, s.Key)
+	}
+
+	return out
+}
+
 // compareSeries builds the report: every series after the first is compared
 // against the first, which is the reference.
 func compareSeries(series []*seriesData) *CompareReport {
@@ -286,6 +347,7 @@ func cmdCompare(_ context.Context, args []string, out, errOut io.Writer) int {
 	jsonOut := fs.String("json-out", "", "also write the comparison report as JSON to this path")
 	quiet := fs.Bool("quiet", false, "suppress the human-readable table")
 	realOnly := fs.Bool("real-only", false, "print only rows flagged REAL")
+	reference := fs.String("reference", "", "series (or target) name every other series is compared against (default: the first target of the first result file, in targets-file order)")
 
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -318,6 +380,13 @@ func cmdCompare(_ context.Context, args []string, out, errOut io.Writer) int {
 		return exitRefused
 	}
 
+	series, err := selectReference(series, *reference)
+	if err != nil {
+		outf(errOut, "gdrive-bench compare: %v\n", err)
+
+		return exitRefused
+	}
+
 	rep := compareSeries(series)
 
 	if !*quiet {
@@ -339,7 +408,7 @@ func cmdCompare(_ context.Context, args []string, out, errOut io.Writer) int {
 
 // printCompareTable renders the comparison for humans.
 func printCompareTable(out io.Writer, rep *CompareReport, realOnly bool) {
-	outf(out, "reference: %v\n", rep.Reference)
+	outf(out, "reference: %v  (every DELTA reads TARGET relative to this series; --reference overrides)\n", rep.Reference)
 
 	for _, s := range rep.Sources {
 		outf(out, "  %-24v %v trials  %v  commit %v\n", s.Key, s.Trials, s.File, shortCommit(s.Commit))

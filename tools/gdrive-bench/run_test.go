@@ -88,6 +88,100 @@ func TestSelectWorkloads(t *testing.T) {
 	require.Error(t, err)
 }
 
+// gdriveTarget builds a native Drive target with the given tuning object. It
+// never connects; only the decoded config is exercised.
+func gdriveTarget(t *testing.T, tuning string) target {
+	t.Helper()
+
+	got, err := parseTargets([]byte(`[{"name":"native","connection":{"type":"gdrive","config":{
+	   "folderID":"folder-1","tuning":`+tuning+`}}}]`), lookupMap(nil))
+	require.NoError(t, err)
+
+	return got[0]
+}
+
+func TestEffectiveDeleteParallelismPrefersTheTargetKnob(t *testing.T) {
+	const harnessParallelism = 8
+
+	// The target sets the backend knob: it wins, so a sweep of
+	// deleteParallelism actually changes how many deletes are in flight.
+	n, isSet := gdriveTarget(t, `{"deleteParallelism":24}`).deleteParallelism()
+	require.True(t, isSet)
+	require.Equal(t, 24, n)
+	require.Equal(t, 24, effectiveDeleteParallelism(gdriveTarget(t, `{"deleteParallelism":24}`), harnessParallelism))
+
+	// Unset, zero, negative and misspelled all read as "not configured" and
+	// fall back to --parallelism.
+	for _, tuning := range []string{`{}`, `{"deleteParallelism":0}`, `{"deleteParallelism":-4}`, `{"delete_parallelism":24}`} {
+		tgt := gdriveTarget(t, tuning)
+
+		_, isSet := tgt.deleteParallelism()
+		require.False(t, isSet, "tuning %v", tuning)
+		require.Equal(t, harnessParallelism, effectiveDeleteParallelism(tgt, harnessParallelism), "tuning %v", tuning)
+	}
+
+	// A non-Drive target has no such knob at all.
+	fsTargets, err := parseTargets([]byte(`[{"name":"fs","connection":{"type":"filesystem","config":{"path":"/tmp/x"}}}]`), lookupMap(nil))
+	require.NoError(t, err)
+	require.Equal(t, harnessParallelism, effectiveDeleteParallelism(fsTargets[0], harnessParallelism))
+}
+
+func TestDeleteSweepNFlagPlumbing(t *testing.T) {
+	// Default and smoke default are unchanged by the new flag.
+	require.Equal(t, defaultDeleteSweepN, defaultParams().DeleteSweepN)
+	require.Equal(t, smokeDeleteSweepN, smokeParams().DeleteSweepN)
+
+	cfg, err := resolveRunConfig(&runOptions{trials: 1, order: orderABBA, uploadFraction: 0.5})
+	require.NoError(t, err)
+	require.Equal(t, defaultDeleteSweepN, cfg.Params.DeleteSweepN)
+
+	cfg, err = resolveRunConfig(&runOptions{trials: 1, order: orderABBA, uploadFraction: 0.5, deleteSweepN: 500})
+	require.NoError(t, err)
+	require.Equal(t, 500, cfg.Params.DeleteSweepN)
+
+	// It survives smoke mode, so a pacer cycle can ask for a phase long enough
+	// to reach the token bucket without giving up the small smoke sizes.
+	cfg, err = resolveRunConfig(&runOptions{trials: 1, order: orderABBA, uploadFraction: 0.5, smoke: true, deleteSweepN: 40, explicitlySet: map[string]bool{}})
+	require.NoError(t, err)
+	require.Equal(t, 40, cfg.Params.DeleteSweepN)
+
+	// And the estimator scales with it, so the quota guard sees the bigger run.
+	small := estimateDeleteSweep(&benchParams{DeleteSweepN: 100, SmallBlobMinBytes: 2048})
+	big := estimateDeleteSweep(&benchParams{DeleteSweepN: 1000, SmallBlobMinBytes: 2048})
+	require.Greater(t, big.QuotaUnits, small.QuotaUnits)
+}
+
+func TestDeleteSweepRecordsItsEffectiveParallelism(t *testing.T) {
+	results := t.TempDir()
+
+	var out, errOut bytes.Buffer
+
+	code := dispatch(context.Background(), []string{
+		"run",
+		"--results-dir", results,
+		"--smoke",
+		"--workloads", "delete-sweep",
+		"--delete-sweep-n", "6",
+		"--parallelism", "3",
+		"--label", "dsweep",
+	}, &out, &errOut)
+	require.Equal(t, exitOK, code, "stdout:\n%v\nstderr:\n%v", out.String(), errOut.String())
+
+	res, err := readResult(findResultFile(t, results, "dsweep"))
+	require.NoError(t, err)
+	require.Equal(t, 6, res.Config.Params.DeleteSweepN)
+
+	m := res.Trials[0].Workloads["delete-sweep"]
+
+	// 6 blobs written, delete_percent (50) of them deleted.
+	require.Equal(t, 3, m.Ops)
+
+	// The filesystem smoke target sets no deleteParallelism, so --parallelism
+	// is what was in force - and the result says so rather than leaving it to
+	// be inferred.
+	require.Equal(t, map[string]int64{deleteSweepParallelismParam: 3}, m.Params)
+}
+
 func TestWorkloadOfKey(t *testing.T) {
 	require.Equal(t, "read-metadata", workloadOfKey("read-metadata:cold"))
 	require.Equal(t, "small-write", workloadOfKey("small-write"))

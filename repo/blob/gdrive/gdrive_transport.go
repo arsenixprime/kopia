@@ -122,6 +122,15 @@ type MethodStats struct {
 	// BackoffMS is the total time spent in pacer backoff for this method.
 	BackoffMS int64 `json:"backoffMS"`
 
+	// PacedWaits is the number of steady-state token waits this method paid,
+	// and PacedWaitMS their total length. They count the pacer's ERROR-FREE
+	// throttling: a call that had to wait for the token bucket to refill even
+	// though nothing failed. Backoffs/BackoffMS count the error path instead.
+	// Both being zero on a busy window is the measurement that says the pacer's
+	// steady-state interval never bound.
+	PacedWaits  int64 `json:"pacedWaits"`
+	PacedWaitMS int64 `json:"pacedWaitMS"`
+
 	// LatencySumMS is the total time-to-first-response-header across Calls.
 	LatencySumMS int64 `json:"latencySumMS"`
 
@@ -155,21 +164,30 @@ type TransportStatsSnapshot struct {
 	// "transport_error"; pacer-detected failures appear under the reason string
 	// the pacer supplies (typically a gdriveerr classification).
 	ErrorsByReason map[string]int64 `json:"errorsByReason"`
+
+	// PacedWaits and PacedWaitMS are the sums of the per-method counters of the
+	// same name. They are carried here as well so that a reader that only wants
+	// "did the pacer throttle this window at all" does not have to walk
+	// PerMethod; PerMethod remains the authority and the two always agree.
+	PacedWaits  int64 `json:"pacedWaits"`
+	PacedWaitMS int64 `json:"pacedWaitMS"`
 }
 
 // methodCounters holds the live counters for one method key. Every field is an
 // atomic, so counters may be updated from any number of concurrent RoundTrips
 // while a snapshot is being taken.
 type methodCounters struct {
-	calls        atomic.Int64
-	errors       atomic.Int64
-	retries      atomic.Int64
-	backoffs     atomic.Int64
-	backoffNanos atomic.Int64
-	bytesUp      atomic.Int64
-	bytesDown    atomic.Int64
-	latencyNanos atomic.Int64
-	latency      [latencyBucketCount]atomic.Int64
+	calls          atomic.Int64
+	errors         atomic.Int64
+	retries        atomic.Int64
+	backoffs       atomic.Int64
+	backoffNanos   atomic.Int64
+	pacedWaits     atomic.Int64
+	pacedWaitNanos atomic.Int64
+	bytesUp        atomic.Int64
+	bytesDown      atomic.Int64
+	latencyNanos   atomic.Int64
+	latency        [latencyBucketCount]atomic.Int64
 }
 
 func (c *methodCounters) observeLatency(d time.Duration) {
@@ -200,6 +218,8 @@ func (c *methodCounters) snapshot() MethodStats {
 		BytesUp:      c.bytesUp.Load(),
 		BytesDown:    c.bytesDown.Load(),
 		BackoffMS:    c.backoffNanos.Load() / int64(time.Millisecond),
+		PacedWaits:   c.pacedWaits.Load(),
+		PacedWaitMS:  c.pacedWaitNanos.Load() / int64(time.Millisecond),
 		LatencySumMS: c.latencyNanos.Load() / int64(time.Millisecond),
 		LatencyMS:    make([]int64, latencyBucketCount),
 	}
@@ -292,10 +312,12 @@ func (s *TransportStats) addReason(reason string) {
 
 // RecordRetry counts one retry attempt for op.
 //
-// RecordRetry, RecordError and RecordBackoff exist so that the pacer can report
-// into the same stats object as the transport. They structurally satisfy the
-// pacer's Recorder interface; that interface is deliberately NOT imported, to
-// keep the transport free of any dependency on the pacer.
+// RecordRetry, RecordError, RecordBackoff and RecordPacedWait exist so that the
+// pacer can report into the same stats object as the transport. They
+// structurally satisfy the pacer's Recorder interface; that interface is
+// deliberately NOT imported, to keep the transport free of any dependency on
+// the pacer. Adding a method to it therefore means adding one here too, or the
+// backend stops compiling at gdrivepacer.New.
 func (s *TransportStats) RecordRetry(op string) {
 	s.counters(op).retries.Add(1)
 }
@@ -319,6 +341,19 @@ func (s *TransportStats) RecordBackoff(op string, d time.Duration) {
 	}
 }
 
+// RecordPacedWait counts one steady-state pacer wait of duration d for op. A
+// non-positive d is ignored entirely - not even the count is incremented -
+// because a call that did not have to wait is not evidence of pacing.
+func (s *TransportStats) RecordPacedWait(op string, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+
+	c := s.counters(op)
+	c.pacedWaits.Add(1)
+	c.pacedWaitNanos.Add(int64(d))
+}
+
 // Snapshot returns a JSON-serializable copy of the current counters. It
 // allocates only the returned maps and slices; the hot path (RoundTrip) never
 // allocates on account of stats.
@@ -335,7 +370,10 @@ func (s *TransportStats) Snapshot() TransportStatsSnapshot {
 	}
 
 	for k, c := range s.perMethod {
-		res.PerMethod[k] = c.snapshot()
+		ms := c.snapshot()
+		res.PerMethod[k] = ms
+		res.PacedWaits += ms.PacedWaits
+		res.PacedWaitMS += ms.PacedWaitMS
 	}
 
 	for k, c := range s.errorsByReason {

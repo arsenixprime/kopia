@@ -94,6 +94,15 @@ API calls than the burst pool, or that issues them slower than the refill rate,
 cannot be affected by `minSleep` at all.** Predict accordingly, and prefer a
 prediction that can be falsified.
 
+**For any pacer hypothesis, `paced_wait_ms` is the falsifier.** Every workload
+phase reports the total time its calls spent waiting for the token bucket
+(`SCHEMA.md` §8.6; per method in `transport_delta.perMethod[…].pacedWaitMS`).
+`paced_wait_ms = 0` on the control lane means the pacer's steady-state interval
+never bound at all, so **no value of `pacerMinSleepMS` or `pacerBurst` can
+change anything** and the cycle is answered without reading a single wall clock.
+Design the workload set until the control lane shows a non-zero
+`paced_wait_ms`, *then* run the comparison.
+
 ### 3.2 Build a two-target targets file
 
 The controlled experiment is **one run with two targets**, not two runs. The
@@ -183,15 +192,18 @@ One file holding two targets compares against itself.
 (Flags must precede the file: Go's `flag` package stops parsing at the first
 non-flag argument.)
 
-> **Sign hazard — read this before writing down a delta.** `compare` picks the
-> **alphabetically first** series as the reference, not the first one in the
-> targets file (`RunResult.targetNames()` sorts, and `buildSeries` keeps that
-> order). With lanes named `control` and `candidate`, the reference is
-> **`candidate`**, so `delta_pct` reads *control relative to candidate* and the
-> sign is inverted from what you expect. Always read the report's `reference`
-> field — or the `reference:` line of the printed table — before interpreting a
-> single number. This is logged as a harness change request in
-> `TUNING_LOG.md` (cycle 1).
+**The reference is the first target in the targets file.** Put `control` first
+and every `delta_pct` reads *candidate relative to control*: negative means the
+candidate was faster on a lower-is-better metric. `--reference=<name>` overrides
+it (a series key, or a target name when unambiguous).
+
+> **Historical note.** Before WP-4b, `compare` picked the **alphabetically
+> first** series, so lanes named `control` / `candidate` were reported against
+> `candidate` and every delta was inverted. Cycle 1's table in `TUNING_LOG.md`
+> is written in that convention and says so; any report generated before WP-4b
+> must be read with its own `reference` field in hand. Reading `reference`
+> before interpreting a number is still the cheap habit — it is one line at the
+> top of the printed table.
 
 `improvement` says whether the delta's direction is the good one (only
 `ops_per_sec` is higher-is-better). Read `significance` on every row, not just
@@ -203,7 +215,8 @@ the ones you care about.
 
 1. the **target metric** moved in the predicted direction and its row is `REAL`;
 2. **no other metric on any workload regressed `REAL`** — check
-   `wall_clock_ms`, `p50/p90/p99_ms`, `ops_per_sec`, `errors`, `quota_units`;
+   `wall_clock_ms`, `p50/p90/p99_ms`, `ops_per_sec`, `errors`, `quota_units`,
+   `paced_wait_ms`;
 3. **no error-rate increase**: `errors` stays 0 on every workload, and summing
    `trials[].errors_by_reason` over each target shows no new or larger
    `rate_limit_exceeded`, `user_rate_limit_exceeded`, `http_403` or
@@ -295,13 +308,59 @@ ticket.
    workload that *sustains* more than 10 API calls/s — that means parallelism,
    not more blobs. **`pacerBurst` is the untested half** and the same arithmetic
    applies to it. Do the arithmetic before spending an hour; cycle 1 is the
-   worked example.
+   worked example — and since WP-4b you no longer have to trust the arithmetic:
+   run anything at all and read `paced_wait_ms`. A zero there is the direct
+   measurement cycle 1 could not take. The cheapest way to reach a non-zero one
+   is item 2's high-parallelism `delete-sweep`, which is why that cycle should
+   come first.
 2. **`deleteParallelism`** (default 8, range 1..32). Mechanism: more concurrent
    `files.delete` calls in flight. Phase 2 measured parallel singles at
    19.5–23 blobs/s and batch deletes at 8.6, so the parallel path is the one
-   worth sweeping. Note the harness's own `--parallelism` also bounds
-   `delete-sweep`; to see the backend knob you may need to raise both, and a
-   run that changes `--parallelism` is not comparable to the standing baseline.
+   worth sweeping.
+
+   **Recipe (corrected after cycle 1).** Two things used to make this hypothesis
+   untestable, and both are fixed:
+
+   - The harness's own `--parallelism` (default 8) was the tighter of the two
+     bounds and clamped the backend knob out of the experiment. `delete-sweep`
+     now takes its parallelism from the **target's** `tuning.deleteParallelism`
+     when the target sets one, so setting the knob in the targets file is
+     enough — do **not** also pass `--parallelism`, which would change the
+     cleanup phase of every other workload and make the run non-comparable to
+     the baseline. Confirm what was actually in force by reading
+     `trials[].workloads["delete-sweep"].params.parallelism` in the result.
+   - The measured phase was too short to be worth timing (50 deletes, ~2.4 s).
+     Pass `--delete-sweep-n 400` (or more) so the phase lasts tens of seconds
+     and the difference is bigger than the trial-to-trial spread. Both lanes get
+     the same `-n`, so the comparison stays controlled; the number is recorded
+     in `config.params.delete_sweep_n`, so a run at a different `-n` is simply
+     not comparable to one at the default.
+
+   ```jsonc
+   [
+     {"name":"control","connection":{"type":"gdrive","config":{
+       "folderID":"${KOPIA_GDRIVE_BENCH_FOLDER_NATIVE}",
+       "credentialsFile":"${KOPIA_GDRIVE_TEST_CREDENTIALS}",
+       "tuning":{"cacheDir":"/abs/scratch/cache-control","deleteParallelism":8}}}},
+     {"name":"candidate","connection":{"type":"gdrive","config":{
+       "folderID":"${KOPIA_GDRIVE_BENCH_FOLDER_NATIVE}",
+       "credentialsFile":"${KOPIA_GDRIVE_TEST_CREDENTIALS}",
+       "tuning":{"cacheDir":"/abs/scratch/cache-candidate","deleteParallelism":24}}}}
+   ]
+   ```
+   ```bash
+   /tmp/gdrive-bench run --targets … --workloads delete-sweep \
+     --delete-sweep-n 400 --trials 5 --order abba --seed <fixed> \
+     --label tuning-cycle-N-deleteparallelism
+   ```
+
+   Spell the control's `8` out rather than leaving it unset: the two lanes then
+   differ in exactly one JSON value, and `targets[].knobs` in the result proves
+   it. Watch `errors_by_reason` closely — this is the knob most likely to earn
+   a `userRateLimitExceeded`. At 24 concurrent deletes the workload draws well
+   over 10 calls/s, so it is also the **first workload in the suite that can
+   make `pacerMinSleepMS` bind**: check `paced_wait_ms` (§below) to see whether
+   it did.
 3. **`uploadChunkSizeMB` × pack size grid**, for `pack-write`. Mechanism:
    fewer, larger resumable chunks trade request count (each chunk is an
    edit-class request = quota) against retry granularity. Sweep

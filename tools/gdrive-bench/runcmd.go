@@ -58,6 +58,7 @@ type runOptions struct {
 	uploadFraction float64
 	packSizeMB     int64
 	smallWriteN    int
+	deleteSweepN   int
 	parallelism    int
 	harnessCommit  string
 	trueCold       bool
@@ -84,7 +85,8 @@ func cmdRun(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs.Float64Var(&o.uploadFraction, "daily-upload-fraction", defaultDailyUploadFraction, "fraction of Google's 750 GB/day/user upload cap this harness may spend in one UTC day")
 	fs.Int64Var(&o.packSizeMB, "pack-size-mb", 0, "size of a pack-write blob in MB (default: 20)")
 	fs.IntVar(&o.smallWriteN, "small-write-n", 0, "number of small-write blobs (default: 100, smoke: 10)")
-	fs.IntVar(&o.parallelism, "parallelism", 0, "bounded parallelism of delete-sweep and cleanup (default: 8)")
+	fs.IntVar(&o.deleteSweepN, "delete-sweep-n", 0, "number of blobs delete-sweep writes, of which it deletes delete_percent (default: 100, smoke: 10)")
+	fs.IntVar(&o.parallelism, "parallelism", 0, "bounded parallelism of cleanup, and of delete-sweep unless the target sets tuning.deleteParallelism (default: 8)")
 	fs.StringVar(&o.harnessCommit, "harness-commit", "", "override the recorded harness commit (default: git rev-parse HEAD)")
 	fs.BoolVar(&o.trueCold, "true-cold", false, "make read-metadata:cold genuinely cold by deleting the on-disk file ID journal between passes (adds a read-metadata:warm phase; requires every Drive target to set config.tuning.cacheDir)")
 	fs.StringVar(&o.kopiaExe, "kopia-exe", "", "kopia binary the snapshot-e2e workload drives (default: build one from the current work tree)")
@@ -214,6 +216,10 @@ func resolveRunConfig(o *runOptions) (RunConfig, error) {
 
 	if o.smallWriteN > 0 {
 		params.SmallWriteN = o.smallWriteN
+	}
+
+	if o.deleteSweepN > 0 {
+		params.DeleteSweepN = o.deleteSweepN
 	}
 
 	if o.parallelism > 0 {

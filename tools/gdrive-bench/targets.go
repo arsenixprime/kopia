@@ -336,6 +336,22 @@ func (t target) fileIDCacheDir() (dir string, isDriveTarget bool) {
 	return o.Tuning.CacheDir, true
 }
 
+// deleteParallelism returns the target's configured tuning.deleteParallelism
+// and whether the target set one at all.
+//
+// Like fileIDCacheDir it reads the decoded connection config rather than the
+// raw JSON, so a misspelled key reads as "unset" (and the run then uses
+// --parallelism) instead of being honored by the harness while the backend
+// ignores it - which would be the worst of both worlds for a tuning cycle.
+func (t target) deleteParallelism() (n int, isSet bool) {
+	o, ok := t.Conn.Config.(*gdrive.Options)
+	if !ok || o.Tuning.DeleteParallelism <= 0 {
+		return 0, false
+	}
+
+	return o.Tuning.DeleteParallelism, true
+}
+
 // validateTrueCold refuses a true-cold run whose Drive targets do not name a
 // cache directory of their own.
 //

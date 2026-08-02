@@ -55,6 +55,182 @@ func synthResult(label string, targets map[string][]float64) *RunResult {
 	return r
 }
 
+// synthOrderedResult builds a two-target result document whose targets[] order
+// is the given one, with one wall_clock_ms value per trial per target. The
+// names are chosen by the caller so that a test can make configuration order
+// and alphabetical order disagree.
+func synthOrderedResult(names [2]string, values [2][]float64) *RunResult {
+	const label = "cycle"
+
+	r := &RunResult{
+		SchemaVersion: schemaVersion,
+		RunID:         "r" + label,
+		Label:         label,
+		StartedAt:     time.Unix(0, 0).UTC(),
+		FinishedAt:    time.Unix(60, 0).UTC(),
+		Harness:       HarnessInfo{Commit: "deadbeefdeadbeef"},
+		Config:        RunConfig{Trials: len(values[0]), Order: orderABBA, Params: defaultParams()},
+		Trials:        []TrialResult{},
+		Errors:        []string{},
+	}
+
+	for _, n := range names {
+		r.Targets = append(r.Targets, TargetInfo{Name: n, StorageType: "filesystem"})
+	}
+
+	// Trials are appended ABBA-style, so execution order differs from
+	// configuration order too and cannot accidentally stand in for it.
+	for i := range values[0] {
+		order := []int{0, 1}
+		if i%2 == 1 {
+			order = []int{1, 0}
+		}
+
+		for _, ti := range order {
+			r.Trials = append(r.Trials, TrialResult{
+				Trial:  i,
+				Target: names[ti],
+				Workloads: map[string]WorkloadMetrics{
+					"small-write": {
+						WallClockMS: values[ti][i],
+						Ops:         10,
+						Samples:     10,
+						Latency:     Percentiles{P10: values[ti][i], P50: values[ti][i], P90: values[ti][i], P99: values[ti][i]},
+					},
+				},
+				ErrorsByReason: map[string]int64{},
+			})
+		}
+	}
+
+	return r
+}
+
+// TestCompareReferenceFollowsConfigurationOrder is the regression test for the
+// sign-inversion hazard tuning cycle 1 hit: "control" sorts AFTER "candidate",
+// so an alphabetical reference silently reads every delta backwards.
+func TestCompareReferenceFollowsConfigurationOrder(t *testing.T) {
+	// control is configured first and is the slower lane.
+	res := synthOrderedResult([2]string{"control", "candidate"}, [2][]float64{
+		{200, 210, 205},
+		{100, 105, 102},
+	})
+
+	require.Equal(t, []string{"control", "candidate"}, res.targetNames(),
+		"targetNames must follow targets[], which is targets-file order")
+
+	series := buildSeries([]string{"x.json"}, []*RunResult{res})
+	require.Equal(t, "control", series[0].Key)
+
+	rep := compareSeries(series)
+	require.Equal(t, "control", rep.Reference)
+
+	row := findRow(t, rep, "small-write", "wall_clock_ms")
+	require.Equal(t, "candidate", row.Target)
+	require.Equal(t, sigReal, row.Significance)
+	require.Negative(t, row.DeltaPct, "the faster candidate must read as a negative delta against the control reference")
+	require.True(t, row.Improvement)
+}
+
+func TestCompareReferenceOverride(t *testing.T) {
+	res := synthOrderedResult([2]string{"control", "candidate"}, [2][]float64{
+		{200, 210, 205},
+		{100, 105, 102},
+	})
+
+	series := buildSeries([]string{"x.json"}, []*RunResult{res})
+
+	flipped, err := selectReference(series, "candidate")
+	require.NoError(t, err)
+	require.Equal(t, []string{"candidate", "control"}, seriesKeys(flipped))
+
+	rep := compareSeries(flipped)
+	require.Equal(t, "candidate", rep.Reference)
+
+	row := findRow(t, rep, "small-write", "wall_clock_ms")
+	require.Equal(t, "control", row.Target)
+	require.Positive(t, row.DeltaPct, "with the candidate as reference the slower control reads positive")
+
+	// An empty override changes nothing.
+	same, err := selectReference(series, "")
+	require.NoError(t, err)
+	require.Equal(t, series, same)
+
+	// An unknown name is refused, and the message names what is available.
+	_, err = selectReference(series, "nosuchlane")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "control")
+	require.Contains(t, err.Error(), "candidate")
+}
+
+func TestCompareReferenceOverrideOnAmbiguousTargetName(t *testing.T) {
+	res := synthOrderedResult([2]string{"control", "candidate"}, [2][]float64{{1, 2}, {3, 4}})
+	series := buildSeries([]string{"a.json", "b.json"}, []*RunResult{res, res})
+
+	// The same target in two files gets suffixed keys, so the bare target name
+	// is ambiguous and must be refused rather than guessed.
+	_, err := selectReference(series, "control")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "control@0")
+
+	picked, err := selectReference(series, "control@1")
+	require.NoError(t, err)
+	require.Equal(t, "control@1", picked[0].Key)
+}
+
+func TestCompareCommandReferenceFlag(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cycle.json")
+	jsonOut := filepath.Join(dir, "report.json")
+
+	require.NoError(t, writeResult(path, synthOrderedResult([2]string{"control", "candidate"}, [2][]float64{
+		{200, 210, 205},
+		{100, 105, 102},
+	})))
+
+	var out, errOut bytes.Buffer
+
+	code := dispatch(context.Background(), []string{"compare", "--reference", "candidate", "--json-out", jsonOut, path}, &out, &errOut)
+	require.Equal(t, exitOK, code, errOut.String())
+	require.Contains(t, out.String(), "reference: candidate")
+
+	data, err := os.ReadFile(jsonOut)
+	require.NoError(t, err)
+
+	rep := &CompareReport{}
+	require.NoError(t, json.Unmarshal(data, rep))
+	require.Equal(t, "candidate", rep.Reference)
+
+	// Without the flag the reference is the first configured target.
+	out.Reset()
+	errOut.Reset()
+
+	code = dispatch(context.Background(), []string{"compare", "--json-out", jsonOut, path}, &out, &errOut)
+	require.Equal(t, exitOK, code, errOut.String())
+	require.Contains(t, out.String(), "reference: control")
+
+	// A name no series carries is refused before anything is written.
+	errOut.Reset()
+
+	code = dispatch(context.Background(), []string{"compare", "--reference", "nope", path}, &out, &errOut)
+	require.Equal(t, exitRefused, code)
+	require.Contains(t, errOut.String(), "no series named")
+}
+
+func findRow(t *testing.T, rep *CompareReport, workload, metric string) CompareRow {
+	t.Helper()
+
+	for i := range rep.Rows {
+		if rep.Rows[i].Workload == workload && rep.Rows[i].Metric == metric {
+			return rep.Rows[i]
+		}
+	}
+
+	t.Fatalf("no %v/%v row in the report", workload, metric)
+
+	return CompareRow{}
+}
+
 func TestClassifyDisjointIntervalsAreReal(t *testing.T) {
 	ref := summarize([]float64{100, 101, 102, 103, 104})
 	cand := summarize([]float64{200, 201, 202, 203, 204})

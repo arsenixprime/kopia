@@ -87,10 +87,12 @@ func (f *fakeClock) elapsedSince(t time.Time) time.Duration {
 
 // countingRecorder implements Recorder and counts what it is told.
 type countingRecorder struct {
-	mu       sync.Mutex
-	retries  int
-	errors   []string
-	backoffs []time.Duration
+	mu         sync.Mutex
+	retries    int
+	errors     []string
+	backoffs   []time.Duration
+	pacedWaits []time.Duration
+	pacedOps   []string
 }
 
 func (r *countingRecorder) RecordRetry(string) {
@@ -114,11 +116,26 @@ func (r *countingRecorder) RecordBackoff(_ string, d time.Duration) {
 	r.backoffs = append(r.backoffs, d)
 }
 
+func (r *countingRecorder) RecordPacedWait(op string, d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.pacedWaits = append(r.pacedWaits, d)
+	r.pacedOps = append(r.pacedOps, op)
+}
+
 func (r *countingRecorder) snapshot() (retries int, errs []string, backoffs []time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	return r.retries, append([]string(nil), r.errors...), append([]time.Duration(nil), r.backoffs...)
+}
+
+func (r *countingRecorder) pacedSnapshot() (waits []time.Duration, ops []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]time.Duration(nil), r.pacedWaits...), append([]string(nil), r.pacedOps...)
 }
 
 // gerr builds a *googleapi.Error the way the Drive client library would.
@@ -249,6 +266,86 @@ func TestSteadyStatePacingHonorsBurst(t *testing.T) {
 	}
 
 	require.Equal(t, time.Duration(calls-burst)*minSleep, clk.elapsedSince(start))
+}
+
+// TestSteadyStateWaitsAreRecorded pins the counter that makes a pacer
+// hypothesis falsifiable: every token wait actually slept is reported to the
+// Recorder with its real length, and nothing else is.
+func TestSteadyStateWaitsAreRecorded(t *testing.T) {
+	const (
+		minSleep = 100 * time.Millisecond
+		burst    = 3
+		calls    = 6
+	)
+
+	rec := &countingRecorder{}
+	p, clk := newTestPacer(t, Config{MinSleep: minSleep, Burst: burst}, rec)
+	start := clk.Now()
+
+	for range calls {
+		require.NoError(t, p.Call(t.Context(), "ListBlobs", "", func() error { return nil }))
+	}
+
+	waits, ops := rec.pacedSnapshot()
+
+	// Only the calls that outran the bucket are recorded - the first `burst`
+	// found a token waiting for them and paid nothing.
+	require.Len(t, waits, calls-burst)
+	require.Equal(t, []string{"ListBlobs", "ListBlobs", "ListBlobs"}, ops)
+
+	var total time.Duration
+
+	for _, d := range waits {
+		require.Equal(t, minSleep, d)
+
+		total += d
+	}
+
+	// The counter sums to exactly the wall clock the pacer cost, which is the
+	// property a tuning cycle reads it for.
+	require.Equal(t, clk.elapsedSince(start), total)
+
+	// A clean run touches the error path not at all.
+	retries, errs, backoffs := rec.snapshot()
+	require.Zero(t, retries)
+	require.Empty(t, errs)
+	require.Empty(t, backoffs)
+}
+
+func TestNoPacedWaitRecordedWhenTheBucketNeverEmpties(t *testing.T) {
+	const calls = 10
+
+	rec := &countingRecorder{}
+	p, clk := newTestPacer(t, Config{MinSleep: time.Second, Burst: calls}, rec)
+
+	for range calls {
+		require.NoError(t, p.Call(t.Context(), "GetMetadata", "", func() error { return nil }))
+	}
+
+	waits, _ := rec.pacedSnapshot()
+	require.Empty(t, waits, "a workload that stays inside the burst pool must record no paced wait")
+	require.Empty(t, clk.recorded())
+}
+
+func TestInterruptedTokenWaitIsNotRecorded(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	rec := &countingRecorder{}
+	p, clk := newTestPacer(t, Config{MinSleep: time.Second, Burst: 1}, rec)
+
+	// The first call empties the bucket; the second has to wait, and the
+	// context dies while it does.
+	require.NoError(t, p.Call(ctx, "PutBlob", "b1", func() error { return nil }))
+
+	clk.mu.Lock()
+	clk.onSleep = func(time.Duration) { cancel() }
+	clk.mu.Unlock()
+
+	require.ErrorIs(t, p.Call(ctx, "PutBlob", "b2", func() error { return nil }), context.Canceled)
+
+	waits, _ := rec.pacedSnapshot()
+	require.Empty(t, waits, "a wait that was never paid must not be counted")
 }
 
 func TestRetryableBackoffRetriesWithGrowingDelay(t *testing.T) {
