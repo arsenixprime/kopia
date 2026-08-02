@@ -1,0 +1,730 @@
+//go:build !no_extra_providers
+
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"math/rand/v2"
+	"slices"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/pkg/errors"
+
+	"github.com/kopia/kopia/internal/gather"
+	"github.com/kopia/kopia/internal/timetrack"
+	"github.com/kopia/kopia/repo/blob"
+)
+
+// benchParams are the workload sizes. They are recorded verbatim in every
+// result document, because a number is only comparable against another number
+// produced with the same parameters.
+type benchParams struct {
+	SmallWriteN       int   `json:"small_write_n"`
+	SmallBlobMinBytes int   `json:"small_blob_min_bytes"`
+	SmallBlobMaxBytes int   `json:"small_blob_max_bytes"`
+	PackWriteM        int   `json:"pack_write_m"`
+	PackSizeBytes     int64 `json:"pack_size_bytes"`
+	ReadMetadataN     int   `json:"read_metadata_n"`
+	RangeReadR        int   `json:"range_read_r"`
+	RangeReadPacks    int   `json:"range_read_packs"`
+	RangeReadPackSize int64 `json:"range_read_pack_size_bytes"`
+	RangeReadMinBytes int64 `json:"range_read_min_bytes"`
+	RangeReadMaxBytes int64 `json:"range_read_max_bytes"`
+	ListTraversals    int   `json:"list_traversals"`
+	ListBlobsN        int   `json:"list_blobs_n"`
+	DeleteSweepN      int   `json:"delete_sweep_n"`
+	DeletePercent     int   `json:"delete_percent"`
+	Parallelism       int   `json:"parallelism"`
+}
+
+// Default workload sizes.
+const (
+	mib int64 = 1 << 20
+
+	defaultSmallWriteN       = 100
+	defaultSmallBlobMinBytes = 2 * 1024
+	defaultSmallBlobMaxBytes = 8 * 1024
+	defaultPackWriteM        = 5
+	defaultPackSizeMB        = 20
+	defaultReadMetadataN     = 50
+	defaultRangeReadR        = 50
+	defaultRangeReadPacks    = 2
+	defaultRangeReadMinBytes = 4 * 1024
+	defaultRangeReadMaxBytes = 256 * 1024
+	defaultListTraversals    = 5
+	defaultListBlobsN        = 40
+	defaultDeleteSweepN      = 100
+	defaultDeletePercent     = 50
+	defaultParallelism       = 8
+)
+
+// Smoke-mode workload sizes. pack-write deliberately keeps the full 20 MB
+// object: it is the only workload whose point is the large-upload path, and a
+// smoke run that never exercises a resumable upload would not be a smoke test
+// of it. Everything else shrinks to single digits.
+const (
+	smokeSmallWriteN       = 10
+	smokePackWriteM        = 1
+	smokeReadMetadataN     = 5
+	smokeRangeReadR        = 5
+	smokeRangeReadPacks    = 1
+	smokeRangeReadPackSize = 4 * mib
+	smokeListTraversals    = 2
+	smokeListBlobsN        = 5
+	smokeDeleteSweepN      = 10
+)
+
+// defaultParams returns the full-size workload parameters.
+func defaultParams() benchParams {
+	return benchParams{
+		SmallWriteN:       defaultSmallWriteN,
+		SmallBlobMinBytes: defaultSmallBlobMinBytes,
+		SmallBlobMaxBytes: defaultSmallBlobMaxBytes,
+		PackWriteM:        defaultPackWriteM,
+		PackSizeBytes:     defaultPackSizeMB * mib,
+		ReadMetadataN:     defaultReadMetadataN,
+		RangeReadR:        defaultRangeReadR,
+		RangeReadPacks:    defaultRangeReadPacks,
+		RangeReadPackSize: defaultPackSizeMB * mib,
+		RangeReadMinBytes: defaultRangeReadMinBytes,
+		RangeReadMaxBytes: defaultRangeReadMaxBytes,
+		ListTraversals:    defaultListTraversals,
+		ListBlobsN:        defaultListBlobsN,
+		DeleteSweepN:      defaultDeleteSweepN,
+		DeletePercent:     defaultDeletePercent,
+		Parallelism:       defaultParallelism,
+	}
+}
+
+// smokeParams shrinks every workload to the smallest size that still exercises
+// its code path.
+func smokeParams() benchParams {
+	p := defaultParams()
+	p.SmallWriteN = smokeSmallWriteN
+	p.PackWriteM = smokePackWriteM
+	p.ReadMetadataN = smokeReadMetadataN
+	p.RangeReadR = smokeRangeReadR
+	p.RangeReadPacks = smokeRangeReadPacks
+	p.RangeReadPackSize = smokeRangeReadPackSize
+	p.ListTraversals = smokeListTraversals
+	p.ListBlobsN = smokeListBlobsN
+	p.DeleteSweepN = smokeDeleteSweepN
+
+	return p
+}
+
+// workloadEstimate is a workload's predicted cost, used by the quota guard
+// before anything is written.
+type workloadEstimate struct {
+	UploadBytes int64
+	QuotaUnits  int64
+}
+
+func (e workloadEstimate) plus(o workloadEstimate) workloadEstimate {
+	return workloadEstimate{UploadBytes: e.UploadBytes + o.UploadBytes, QuotaUnits: e.QuotaUnits + o.QuotaUnits}
+}
+
+// phaseMetrics is one result key produced by a workload. Most workloads produce
+// exactly one; the ones with a hot/cold or full/prefixed split produce two.
+type phaseMetrics struct {
+	Key     string
+	Metrics WorkloadMetrics
+}
+
+// workloadDef is one entry of the registry. Adding a workload - including the
+// out-of-process snapshot workload of WP-3b - means appending to the registry;
+// the result schema does not change, because workload names are strings and the
+// metrics are a per-workload map.
+type workloadDef struct {
+	// Name is the registry name, selectable through --workloads.
+	Name string
+
+	// Doc is the one-line description printed by "run --help" and "knobs".
+	Doc string
+
+	// Estimate predicts the cost of one execution, for the quota guard.
+	Estimate func(p benchParams) workloadEstimate
+
+	// Run performs setup, measurement and (through the runner's deferred
+	// cleanup) teardown of one execution.
+	Run func(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error)
+}
+
+// allWorkloads is the registry, in execution order.
+func allWorkloads() []workloadDef {
+	return []workloadDef{
+		{
+			Name:     "small-write",
+			Doc:      "N small index-like blobs, one at a time - per-operation write overhead",
+			Estimate: estimateSmallWrite,
+			Run:      runSmallWrite,
+		},
+		{
+			Name:     "pack-write",
+			Doc:      "M large pack blobs - upload throughput and the resumable-upload path",
+			Estimate: estimatePackWrite,
+			Run:      runPackWrite,
+		},
+		{
+			Name:     "read-metadata",
+			Doc:      "GetMetadata over a written set, with a hot and a cold file-ID cache",
+			Estimate: estimateReadMetadata,
+			Run:      runReadMetadata,
+		},
+		{
+			Name:     "range-read",
+			Doc:      "R seeded random range reads from pack blobs",
+			Estimate: estimateRangeRead,
+			Run:      runRangeRead,
+		},
+		{
+			Name:     "list-heavy",
+			Doc:      "repeated whole-storage and prefixed ListBlobs traversals",
+			Estimate: estimateListHeavy,
+			Run:      runListHeavy,
+		},
+		{
+			Name:     "delete-sweep",
+			Doc:      "delete a percentage of a written set with bounded parallelism",
+			Estimate: estimateDeleteSweep,
+			Run:      runDeleteSweep,
+		},
+	}
+}
+
+// workloadByName looks a workload up in the registry.
+func workloadByName(name string) (workloadDef, bool) {
+	for _, w := range allWorkloads() {
+		if w.Name == name {
+			return w, true
+		}
+	}
+
+	return workloadDef{}, false
+}
+
+// workloadNames returns every registered workload name, in registry order.
+func workloadNames() []string {
+	out := []string{}
+
+	for _, w := range allWorkloads() {
+		out = append(out, w.Name)
+	}
+
+	return out
+}
+
+// workloadEnv is what a workload gets to work with.
+type workloadEnv struct {
+	params benchParams
+
+	// prefix namespaces every blob this execution creates, so cleanup can find
+	// them all and two concurrent runs cannot collide.
+	prefix blob.ID
+
+	// rnd is seeded per (run, trial, target, workload), so a workload makes the
+	// same random choices for every target of a run.
+	rnd *rand.Rand
+
+	open func(ctx context.Context) (blob.Storage, error)
+	cur  blob.Storage
+}
+
+// storage returns the connection the workload is currently using.
+func (e *workloadEnv) storage() blob.Storage {
+	return e.cur
+}
+
+// recycle flushes and closes the current connection and opens a fresh one. It
+// is how the cold-cache pass drops the backend's in-memory state.
+//
+// This is honest only up to a point, and only for the native backend: the
+// process-wide file-ID cache is refcounted, so dropping the last reference does
+// discard the in-memory map, but the on-disk journal survives - as it does in
+// production, where deleting it would measure a state a real user never has. A
+// truly cold cache needs a fresh process, which is what WP-3b's out-of-process
+// workload provides. For every other backend the two passes differ only in HTTP
+// connection reuse.
+func (e *workloadEnv) recycle(ctx context.Context) error {
+	if e.cur != nil {
+		if err := e.cur.FlushCaches(ctx); err != nil {
+			return errors.Wrap(err, "unable to flush the storage caches")
+		}
+
+		if err := e.cur.Close(ctx); err != nil {
+			return errors.Wrap(err, "unable to close the storage")
+		}
+
+		e.cur = nil
+	}
+
+	st, err := e.open(ctx)
+	if err != nil {
+		return err
+	}
+
+	e.cur = st
+
+	return nil
+}
+
+// blobID builds a namespaced blob ID.
+func (e *workloadEnv) blobID(kind string, i int) blob.ID {
+	return e.prefix + blob.ID(kind) + blob.ID("-") + blob.ID(pad(i))
+}
+
+// idWidth is how many digits a blob ID index is padded to, so IDs sort
+// lexicographically the way they were created.
+const idWidth = 6
+
+func pad(i int) string {
+	s := strconv.Itoa(i)
+	for len(s) < idWidth {
+		s = "0" + s
+	}
+
+	return s
+}
+
+// randomBytes returns n deterministic pseudo-random bytes drawn from the
+// workload's seeded generator.
+func (e *workloadEnv) randomBytes(n int) []byte {
+	buf := make([]byte, n)
+
+	var scratch [8]byte
+
+	for i := 0; i < n; i += len(scratch) {
+		binary.LittleEndian.PutUint64(scratch[:], e.rnd.Uint64())
+		copy(buf[i:], scratch[:])
+	}
+
+	return buf
+}
+
+// writeSet writes count blobs of the given kind and size, without measuring
+// anything. It is the setup phase of the read/list/delete workloads.
+func (e *workloadEnv) writeSet(ctx context.Context, kind string, count int, size func(i int) int64) ([]blob.ID, error) {
+	st := e.storage()
+	ids := make([]blob.ID, 0, count)
+
+	for i := range count {
+		id := e.blobID(kind, i)
+		data := e.randomBytes(int(size(i)))
+
+		if err := st.PutBlob(ctx, id, gather.FromSlice(data), blob.PutOptions{}); err != nil {
+			return ids, errors.Wrapf(err, "unable to write the setup blob %v", id)
+		}
+
+		ids = append(ids, id)
+	}
+
+	return ids, nil
+}
+
+// failure turns a sampler's error tally into the workload's return error.
+func (s *sampler) failure(what string) error {
+	if s.errs == 0 {
+		return nil
+	}
+
+	return errors.Wrapf(s.firstEr, "%v of %v %v operations failed, first error", s.errs, s.ops, what)
+}
+
+// one wraps a single set of metrics under the workload's own name.
+func one(name string, m WorkloadMetrics) []phaseMetrics {
+	return []phaseMetrics{{Key: name, Metrics: m}}
+}
+
+// phaseKey builds the result key of a multi-phase workload.
+func phaseKey(workload, phase string) string {
+	return workload + ":" + phase
+}
+
+// workloadOfKey returns the registry name a result key belongs to.
+func workloadOfKey(key string) string {
+	for i := range len(key) {
+		if key[i] == ':' {
+			return key[:i]
+		}
+	}
+
+	return key
+}
+
+// ---------------------------------------------------------------------------
+// 1. small-write
+// ---------------------------------------------------------------------------
+
+func estimateSmallWrite(p benchParams) workloadEstimate {
+	avg := int64(p.SmallBlobMinBytes+p.SmallBlobMaxBytes) / 2 //nolint:mnd // arithmetic mean of the two bounds.
+
+	return workloadEstimate{
+		UploadBytes: int64(p.SmallWriteN) * avg,
+		QuotaUnits:  int64(p.SmallWriteN)*quWrite(avg) + quCleanup(p.SmallWriteN),
+	}
+}
+
+func runSmallWrite(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
+	st := e.storage()
+	span := e.params.SmallBlobMaxBytes - e.params.SmallBlobMinBytes
+	s := newSampler(st)
+
+	for i := range e.params.SmallWriteN {
+		size := e.params.SmallBlobMinBytes
+		if span > 0 {
+			size += e.rnd.IntN(span + 1)
+		}
+
+		data := e.randomBytes(size)
+		t := timetrack.StartTimer()
+		err := st.PutBlob(ctx, e.blobID("sw", i), gather.FromSlice(data), blob.PutOptions{})
+
+		s.observe(t.Elapsed(), err)
+
+		if err == nil {
+			s.up(int64(size))
+		}
+	}
+
+	return one("small-write", s.finish(st)), s.failure("small-write")
+}
+
+// ---------------------------------------------------------------------------
+// 2. pack-write
+// ---------------------------------------------------------------------------
+
+func estimatePackWrite(p benchParams) workloadEstimate {
+	return workloadEstimate{
+		UploadBytes: int64(p.PackWriteM) * p.PackSizeBytes,
+		QuotaUnits:  int64(p.PackWriteM)*quWrite(p.PackSizeBytes) + quCleanup(p.PackWriteM),
+	}
+}
+
+func runPackWrite(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
+	st := e.storage()
+	s := newSampler(st)
+
+	for i := range e.params.PackWriteM {
+		data := e.randomBytes(int(e.params.PackSizeBytes))
+		t := timetrack.StartTimer()
+		err := st.PutBlob(ctx, e.blobID("pw", i), gather.FromSlice(data), blob.PutOptions{})
+
+		s.observe(t.Elapsed(), err)
+
+		if err == nil {
+			s.up(e.params.PackSizeBytes)
+		}
+	}
+
+	return one("pack-write", s.finish(st)), s.failure("pack-write")
+}
+
+// ---------------------------------------------------------------------------
+// 3. read-metadata
+// ---------------------------------------------------------------------------
+
+func estimateReadMetadata(p benchParams) workloadEstimate {
+	const passes = 2
+
+	avg := int64(p.SmallBlobMinBytes+p.SmallBlobMaxBytes) / 2 //nolint:mnd // arithmetic mean of the two bounds.
+
+	return workloadEstimate{
+		UploadBytes: int64(p.ReadMetadataN) * avg,
+		QuotaUnits: int64(p.ReadMetadataN)*quWrite(avg) +
+			passes*int64(p.ReadMetadataN)*quListItems +
+			quCleanup(p.ReadMetadataN),
+	}
+}
+
+func runReadMetadata(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
+	ids, err := e.writeSet(ctx, "rm", e.params.ReadMetadataN, func(int) int64 {
+		return int64(e.params.SmallBlobMinBytes)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	hot, hotErr := metadataPass(ctx, e.storage(), ids)
+	if hotErr != nil {
+		return one(phaseKey("read-metadata", "hot"), hot), hotErr
+	}
+
+	if err := e.recycle(ctx); err != nil {
+		return one(phaseKey("read-metadata", "hot"), hot), err
+	}
+
+	cold, coldErr := metadataPass(ctx, e.storage(), ids)
+
+	return []phaseMetrics{
+		{Key: phaseKey("read-metadata", "hot"), Metrics: hot},
+		{Key: phaseKey("read-metadata", "cold"), Metrics: cold},
+	}, coldErr
+}
+
+// metadataPass reads the metadata of every blob in ids once.
+func metadataPass(ctx context.Context, st blob.Storage, ids []blob.ID) (WorkloadMetrics, error) {
+	s := newSampler(st)
+
+	for _, id := range ids {
+		t := timetrack.StartTimer()
+		_, err := st.GetMetadata(ctx, id)
+
+		s.observe(t.Elapsed(), err)
+	}
+
+	return s.finish(st), s.failure("read-metadata")
+}
+
+// ---------------------------------------------------------------------------
+// 4. range-read
+// ---------------------------------------------------------------------------
+
+func estimateRangeRead(p benchParams) workloadEstimate {
+	return workloadEstimate{
+		UploadBytes: int64(p.RangeReadPacks) * p.RangeReadPackSize,
+		QuotaUnits: int64(p.RangeReadPacks)*quWrite(p.RangeReadPackSize) +
+			int64(p.RangeReadR)*quDownloadItem +
+			quCleanup(p.RangeReadPacks),
+	}
+}
+
+func runRangeRead(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
+	ids, err := e.writeSet(ctx, "rr", e.params.RangeReadPacks, func(int) int64 {
+		return e.params.RangeReadPackSize
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	st := e.storage()
+	s := newSampler(st)
+
+	buf := gather.NewWriteBuffer()
+	defer buf.Close()
+
+	span := e.params.RangeReadMaxBytes - e.params.RangeReadMinBytes
+
+	for range e.params.RangeReadR {
+		length := e.params.RangeReadMinBytes
+		if span > 0 {
+			length += e.rnd.Int64N(span + 1)
+		}
+
+		if length > e.params.RangeReadPackSize {
+			length = e.params.RangeReadPackSize
+		}
+
+		id := ids[e.rnd.IntN(len(ids))]
+		offset := e.rnd.Int64N(e.params.RangeReadPackSize - length + 1)
+
+		buf.Reset()
+
+		t := timetrack.StartTimer()
+		err := st.GetBlob(ctx, id, offset, length, buf)
+
+		s.observe(t.Elapsed(), err)
+
+		if err == nil {
+			s.down(int64(buf.Length()))
+		}
+	}
+
+	return one("range-read", s.finish(st)), s.failure("range-read")
+}
+
+// ---------------------------------------------------------------------------
+// 5. list-heavy
+// ---------------------------------------------------------------------------
+
+func estimateListHeavy(p benchParams) workloadEstimate {
+	const phases = 2
+
+	return workloadEstimate{
+		UploadBytes: int64(p.ListBlobsN) * int64(p.SmallBlobMinBytes),
+		QuotaUnits: int64(p.ListBlobsN)*quWrite(int64(p.SmallBlobMinBytes)) +
+			phases*int64(p.ListTraversals)*quListItems +
+			quCleanup(p.ListBlobsN),
+	}
+}
+
+func runListHeavy(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
+	if _, err := e.writeSet(ctx, "lh", e.params.ListBlobsN, func(int) int64 {
+		return int64(e.params.SmallBlobMinBytes)
+	}); err != nil {
+		return nil, err
+	}
+
+	st := e.storage()
+
+	// A whole-storage traversal is what blob GC and repository maintenance do,
+	// and it is the listing cost that actually hurts on Drive, so the "full"
+	// phase deliberately uses the empty prefix and pays for everything else in
+	// the folder too.
+	full, fullErr := listPass(ctx, st, "", e.params.ListTraversals)
+	if fullErr != nil {
+		return one(phaseKey("list-heavy", "full"), full), fullErr
+	}
+
+	prefixed, prefixedErr := listPass(ctx, st, e.prefix+"lh-", e.params.ListTraversals)
+
+	return []phaseMetrics{
+		{Key: phaseKey("list-heavy", "full"), Metrics: full},
+		{Key: phaseKey("list-heavy", "prefixed"), Metrics: prefixed},
+	}, prefixedErr
+}
+
+// listPass performs count traversals, timing each one.
+func listPass(ctx context.Context, st blob.Storage, prefix blob.ID, count int) (WorkloadMetrics, error) {
+	s := newSampler(st)
+
+	for range count {
+		t := timetrack.StartTimer()
+		err := st.ListBlobs(ctx, prefix, func(blob.Metadata) error { return nil })
+
+		s.observe(t.Elapsed(), err)
+	}
+
+	return s.finish(st), s.failure("list-heavy")
+}
+
+// ---------------------------------------------------------------------------
+// 6. delete-sweep
+// ---------------------------------------------------------------------------
+
+func estimateDeleteSweep(p benchParams) workloadEstimate {
+	return workloadEstimate{
+		UploadBytes: int64(p.DeleteSweepN) * int64(p.SmallBlobMinBytes),
+		QuotaUnits: int64(p.DeleteSweepN)*quWrite(int64(p.SmallBlobMinBytes)) +
+			int64(p.DeleteSweepN)*quEditItem +
+			quCleanup(p.DeleteSweepN),
+	}
+}
+
+func runDeleteSweep(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
+	ids, err := e.writeSet(ctx, "ds", e.params.DeleteSweepN, func(int) int64 {
+		return int64(e.params.SmallBlobMinBytes)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	victims := ids[:len(ids)*e.params.DeletePercent/percentDivisor]
+	st := e.storage()
+	s := newSampler(st)
+
+	for _, r := range deleteParallel(ctx, st, victims, e.params.Parallelism) {
+		s.observe(r.d, r.err)
+	}
+
+	return one("delete-sweep", s.finish(st)), s.failure("delete-sweep")
+}
+
+// percentDivisor turns DeletePercent into a fraction.
+const percentDivisor = 100
+
+// opResult is one timed operation of a parallel phase.
+type opResult struct {
+	d   time.Duration
+	err error
+}
+
+// deleteParallel deletes ids with bounded parallelism, the way
+// blob.DeleteMultiple does, but timing each operation individually. Results
+// come back in the order of ids so that a run is reproducible.
+func deleteParallel(ctx context.Context, st blob.Storage, ids []blob.ID, parallelism int) []opResult {
+	if parallelism < 1 {
+		parallelism = 1
+	}
+
+	res := make([]opResult, len(ids))
+	sem := make(chan struct{}, parallelism)
+
+	var wg sync.WaitGroup
+
+	for i, id := range ids {
+		sem <- struct{}{}
+
+		wg.Add(1)
+
+		go func() {
+			defer func() {
+				<-sem
+
+				wg.Done()
+			}()
+
+			t := timetrack.StartTimer()
+			err := st.DeleteBlob(ctx, id)
+			res[i] = opResult{d: t.Elapsed(), err: err}
+		}()
+	}
+
+	wg.Wait()
+
+	return res
+}
+
+// cleanupPrefix deletes everything under a prefix. It is deferred by the runner
+// so that it runs even when a workload fails half-way through, and its failures
+// are reported but never fatal: leftover benchmark blobs cost a few bytes,
+// while aborting a run on a cleanup error loses the measurement.
+func cleanupPrefix(ctx context.Context, st blob.Storage, prefix blob.ID, parallelism int) (deleted int, err error) {
+	var ids []blob.ID
+
+	if err := st.ListBlobs(ctx, prefix, func(bm blob.Metadata) error {
+		ids = append(ids, bm.BlobID)
+
+		return nil
+	}); err != nil {
+		return 0, errors.Wrapf(err, "unable to list the blobs of %v for cleanup", prefix)
+	}
+
+	slices.Sort(ids)
+
+	var firstErr error
+
+	for _, r := range deleteParallel(ctx, st, ids, parallelism) {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+	}
+
+	if firstErr != nil {
+		return len(ids), errors.Wrapf(firstErr, "unable to delete some of the %v blobs under %v", len(ids), prefix)
+	}
+
+	return len(ids), nil
+}
+
+// quWrite estimates the quota units one blob write costs: a name resolution
+// (files.list, 100) plus the upload itself. Uploads below the backend's simple
+// upload cutoff are a single edit-class request; larger ones are a resumable
+// session plus one request per chunk. The cutoff and chunk size below are the
+// backend's defaults - a target that tunes them makes this an over-estimate,
+// which is the safe direction for a quota guard.
+func quWrite(size int64) int64 {
+	if size < defaultSimpleUploadCutoffBytes {
+		return quListItems + quEditItem
+	}
+
+	chunks := (size + defaultUploadChunkBytes - 1) / defaultUploadChunkBytes
+
+	return quListItems + (chunks+1)*quEditItem
+}
+
+// quCleanup estimates the cost of a workload's teardown: one listing plus one
+// delete per blob.
+func quCleanup(blobs int) int64 {
+	return quListItems + int64(blobs)*quEditItem
+}
+
+// The native backend's upload defaults, mirrored here for cost estimation only.
+// They are package constants over in repo/blob/gdrive; duplicating the numbers
+// is deliberate, because the estimate must not depend on unexported state.
+const (
+	defaultSimpleUploadCutoffBytes = 8 * mib
+	defaultUploadChunkBytes        = 64 * mib
+)
