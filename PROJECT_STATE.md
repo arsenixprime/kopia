@@ -97,7 +97,7 @@ reviews RECON.md against the gate checklist.
 | 2 Backend rewrite | provider suite green (mock) + validate-provider clean vs real Drive + e2e snapshot cycle | PASSED 2026-08-01 (62f35a2d) |
 | 3 Benchmark framework | one interleaved native-vs-rclone report promoted to curated results | PASSED 2026-08-02 (339ffd7d) |
 | 4 Tuning loop | TUNING.md + one documented cycle in TUNING_LOG.md | PASSED 2026-08-02 (9caf1c7c) |
-| 5 Upstream prep | PR branch, docs, changelog ready | not started |
+| 5 Upstream prep | PR branch, docs, changelog ready | PASSED 2026-08-02 (branch gdrive-native-upstream @ c69b4072) |
 
 ## Work Packages
 
@@ -119,8 +119,38 @@ reviews RECON.md against the gate checklist.
   is filtered from upstream PR — KEEP exported, flagged for reviewers in
   PR_DESCRIPTION. (3) blanket "experimental" wording removed in favor of
   specific validation statements — ACCEPTED.
-- **WP-5b** — tuning knobs as CLI flags (mission gap found at Phase-5
-  review: JSON-only today). Status: DISPATCHED
+- **WP-5b** — tuning knobs as CLI flags: DONE, merged eb8e93f7. All ten
+  knobs at create/connect; unset leaves tuning empty; tri-state
+  --use-batch-delete via kopia's BoolListVar idiom; 4 tests -race green.
+
+## PROJECT COMPLETE 2026-08-02
+
+All six phase gates passed. Upstream branch: gdrive-native-upstream,
+single commit c69b4072 off master 133fc64c (per upstream's
+squash-to-one guideline), byte-identical to gdrive-native-v2 for the
+five upstream paths, zero fork-only artifacts, builds+tests green.
+Working branch gdrive-native-v2: 18 commits ahead of master, retains
+project docs + benchmark harness + curated results.
+
+Definition-of-Done accounting:
+1. Provider suite + validate-provider vs real Drive: MET (Phase 2 gate).
+2. Distinct actionable errors per reason, quota fail-fast: MET (Phase 1).
+3. Interleaved significance-flagged comparisons, frozen schema,
+   unattended regression detection: MET (Phase 3).
+4. One tuning cycle logged + gdrive-tuned.json: MET (Phase 4; cycle 1 =
+   honest REJECT with mechanism).
+5. Beat-or-match tuned rclone on list-heavy/delete-sweep, within noise
+   on pack-write: EXCEEDED vs DEFAULT rclone (native wins every REAL
+   row incl. pack-write +59%). CAVEAT: rclone lane was default-tuned;
+   delete-sweep's +25.5% is the only margin an rclone-side tuning pass
+   could plausibly close. List-heavy margins (3-36x) structural.
+6. PR branch, docs, changelog ready: MET (changelog = PR title per
+   git-chglog; design-issue recommendation noted in PR_DESCRIPTION).
+
+Remaining user-action items (optional): (a) rclone shared-client quota
+experiment needs interactive browser consent; (b) open upstream design
+issue / post plan on #2656 #3788 #4272 before submitting PR; (c) push
+branches + open PR (user's GitHub account).
 
 ### Phase 4 (dispatched 2026-08-02)
 - **WP-4** — TUNING.md + gdrive-tuned.json + cycle 1 (pacer MinSleep):
