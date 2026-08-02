@@ -1011,6 +1011,179 @@ func TestGdriveStorageMockCaseInsensitiveNameQuery(t *testing.T) {
 }
 
 //
+// -------------------------------------------------- folder creation by name
+//
+
+// TestGdriveStorageMockCreateFolderByName is the happy path of --create-folder-name:
+// nothing of that name exists, so the folder is made in the root of My Drive,
+// its ID replaces the empty one in the options before anything is serialized,
+// and the storage that comes back is an ordinary folder-ID storage.
+func TestGdriveStorageMockCreateFolderByName(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d := newFakeDrive(t)
+
+	const folderName = "kopia-created-folder"
+
+	opt := d.optionsForFolderName(t, testutil.TempDirectory(t), folderName)
+
+	st, err := New(ctx, opt, true)
+	require.NoError(t, err)
+
+	defer st.Close(ctx) //nolint:errcheck
+
+	// exactly one folder of that name now exists, in the root of My Drive.
+	ids := d.fileIDsNamed(folderName)
+	require.Len(t, ids, 1)
+	require.Equal(t, []string{driveRootFolderAlias}, d.parentsOf(ids[0]))
+
+	// the caller's options carry the resolved ID, which is what the repository
+	// config file and any repository token are written from.
+	require.Equal(t, ids[0], opt.FolderID)
+	require.Equal(t, folderName, opt.FolderName, "the name is kept as provenance")
+
+	ci := st.ConnectionInfo()
+	require.Equal(t, gdriveStorageType, ci.Type)
+
+	cfg, ok := ci.Config.(*Options)
+	require.True(t, ok)
+	require.Equal(t, ids[0], cfg.FolderID)
+	require.Equal(t, folderName, cfg.FolderName)
+
+	// re-opening from that serialized connection info is what a second machine
+	// does, so it must reach the folder by ID alone.
+	d.registerTransport(t, opt.FolderID)
+	blobtesting.AssertConnectionInfoRoundTrips(ctx, t, st)
+
+	// and it behaves exactly like a folder-ID storage: blobs land in the folder
+	// that was created.
+	require.NoError(t, st.PutBlob(ctx, "someblob", gather.FromSlice([]byte("hello!")), blob.PutOptions{}))
+	blobtesting.AssertGetBlob(ctx, t, st, "someblob", []byte("hello!"))
+
+	blobIDs := d.fileIDsNamed("someblob")
+	require.Len(t, blobIDs, 1)
+	require.Equal(t, []string{ids[0]}, d.parentsOf(blobIDs[0]))
+}
+
+// TestGdriveStorageMockCreateFolderByNameReusesExisting proves the operation is
+// idempotent: a second create with the same name adopts the folder the first
+// one made instead of piling up same-named siblings, which Drive would happily
+// allow.
+func TestGdriveStorageMockCreateFolderByNameReusesExisting(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d := newFakeDrive(t)
+
+	const folderName = "kopia-existing-folder"
+
+	existing := d.addRootFolder(folderName)
+
+	opt := d.optionsForFolderName(t, testutil.TempDirectory(t), folderName)
+
+	st, err := New(ctx, opt, true)
+	require.NoError(t, err)
+
+	defer st.Close(ctx) //nolint:errcheck
+
+	require.Equal(t, existing, opt.FolderID)
+	require.Equal(t, []string{existing}, d.fileIDsNamed(folderName), "no second folder was created")
+	require.Zero(t, d.requestCount(methodFilesCreate), "reuse must not create anything")
+}
+
+// TestGdriveStorageMockCreateFolderByNameAmbiguous: two folders of the same name
+// cannot be told apart, and guessing would silently split a repository in two.
+func TestGdriveStorageMockCreateFolderByNameAmbiguous(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d := newFakeDrive(t)
+
+	const folderName = "kopia-ambiguous-folder"
+
+	first := d.addRootFolder(folderName)
+	second := d.addRootFolder(folderName)
+
+	opt := d.optionsForFolderName(t, testutil.TempDirectory(t), folderName)
+
+	_, err := New(ctx, opt, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), folderName)
+	require.Contains(t, err.Error(), first)
+	require.Contains(t, err.Error(), second)
+	require.Empty(t, opt.FolderID, "an ambiguous name must not resolve to anything")
+}
+
+// TestGdriveStorageMockCreateFolderByNameIsCaseSensitive: Drive's `name =` is
+// case-insensitive, so the query for "kopia-Case" also returns "kopia-case".
+// Reusing that one would put the repository in a folder the user did not name.
+func TestGdriveStorageMockCreateFolderByNameIsCaseSensitive(t *testing.T) {
+	ctx := testlogging.Context(t)
+	d := newFakeDrive(t)
+
+	const (
+		wanted = "kopia-Case-Folder"
+		decoy  = "kopia-case-folder"
+	)
+
+	decoyID := d.addRootFolder(decoy)
+
+	opt := d.optionsForFolderName(t, testutil.TempDirectory(t), wanted)
+
+	st, err := New(ctx, opt, true)
+	require.NoError(t, err)
+
+	defer st.Close(ctx) //nolint:errcheck
+
+	require.NotEqual(t, decoyID, opt.FolderID)
+	require.Equal(t, []string{opt.FolderID}, d.fileIDsNamed(wanted))
+	require.Equal(t, []string{decoyID}, d.fileIDsNamed(decoy), "the differently-cased folder is untouched")
+}
+
+// TestGdriveStorageMockCreateFolderByNameRejected covers the option combinations
+// that cannot mean anything, all of which must fail before any Drive call.
+func TestGdriveStorageMockCreateFolderByNameRejected(t *testing.T) {
+	cases := []struct {
+		name     string
+		opt      Options
+		isCreate bool
+		wantErr  string
+	}{
+		{"neither", Options{}, true, "folder-id must be specified"},
+		{"blank name", Options{FolderName: "   "}, true, "must not be blank"},
+		{"read-only", Options{FolderName: "kopia-ro"}, true, "read-only"},
+		{"connect", Options{FolderName: "kopia-connect"}, false, "creating a repository"},
+	}
+
+	cases[2].opt.ReadOnly = true
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := testlogging.Context(t)
+
+			opt := tc.opt
+			opt.Tuning.CacheDir = testutil.TempDirectory(t)
+
+			_, err := New(ctx, &opt, tc.isCreate)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestGdriveStorageMockFolderNameIgnoredWhenIDIsSet is the steady state after a
+// create-by-name: the configuration carries both fields, and every later
+// connection must use the ID and never go looking for the name again.
+func TestGdriveStorageMockFolderNameIgnoredWhenIDIsSet(t *testing.T) {
+	ctx := testlogging.Context(t)
+
+	d, st := newTunedMockStorage(t, func(o *Options) {
+		o.FolderName = "some-other-folder-entirely"
+	})
+
+	require.Zero(t, d.requestCount(methodFilesCreate))
+	require.Empty(t, d.fileIDsNamed("some-other-folder-entirely"))
+	require.Equal(t, "Google Drive: "+d.rootFolderID, st.DisplayName())
+
+	blobtesting.AssertConnectionInfoRoundTrips(ctx, t, st)
+}
+
+//
 // ---------------------------------------------------------------- live suite
 //
 
@@ -1208,6 +1381,82 @@ func newLiveTestStorage(ctx context.Context, t *testing.T, adjust ...func(*Optio
 		require.NoError(t, st.Close(ctx))
 		deleteLiveTestFolder(ctx, t, opt)
 	}
+}
+
+// TestGdriveStorageLiveCreateFolderByName exercises --create-folder-name against
+// real Google Drive: a uuid-named folder is made in the root of My Drive, is
+// visible to files.get afterwards (which is the whole point - a folder made by
+// hand there would NOT be, under the default drive.file scope), resolves to the
+// same ID when the same name is created again, and is deleted on the way out so
+// the account is left exactly as it was found.
+//
+// It is deliberately NOT named ...StorageLive..., so that it is not swept up by
+// the routine live run: it writes into the root of My Drive rather than into
+// KOPIA_GDRIVE_TEST_FOLDER.
+func TestGdriveLiveCreateFolderByName(t *testing.T) {
+	t.Parallel()
+	testutil.ProviderTest(t)
+
+	ctx := testlogging.Context(t)
+	credentialsFile := getEnvVarOrSkip(t, testCredentialsEnv)
+
+	folderName := "kopia-wp7-" + uuid.NewString()
+
+	newOptions := func() *Options {
+		return &Options{
+			FolderName:                    folderName,
+			ServiceAccountCredentialsFile: credentialsFile,
+			Tuning:                        TuningOptions{CacheDir: testutil.TempDirectory(t)},
+		}
+	}
+
+	opt := newOptions()
+
+	st, err := New(ctx, opt, true)
+	require.NoError(t, err)
+
+	require.NotEmpty(t, opt.FolderID, "the created folder ID must be written back into the options")
+	t.Logf("created Google Drive folder %q with ID %v", folderName, opt.FolderID)
+
+	defer func() {
+		require.NoError(t, st.Close(ctx))
+		deleteLiveTestFolder(ctx, t, opt)
+		t.Logf("deleted Google Drive folder %v", opt.FolderID)
+	}()
+
+	// files.get sees it, it is a folder, and it is in the root of My Drive.
+	service, err := CreateDriveService(ctx, opt)
+	require.NoError(t, err)
+
+	f, err := service.Files.Get(opt.FolderID).SupportsAllDrives(true).Fields("id,name,mimeType,parents,trashed").Context(ctx).Do()
+	require.NoError(t, err, "the created folder must be visible to files.get")
+	require.Equal(t, folderName, f.Name)
+	require.Equal(t, folderMimeType, f.MimeType)
+	require.False(t, f.Trashed)
+
+	// It has exactly one parent, the root of My Drive. The root's own ID cannot be
+	// asserted against here: LIVE-VERIFIED, files.get on "root" is itself a 404
+	// under the drive.file scope - the alias is accepted as a place to CREATE in,
+	// but the root folder is not a file this application made and so cannot be
+	// read. That asymmetry is exactly why this feature has to exist.
+	require.Len(t, f.Parents, 1)
+	t.Logf("parent (My Drive root) is %v", f.Parents[0])
+
+	// and it is usable as a repository folder.
+	require.NoError(t, st.PutBlob(ctx, "wp7-blob", gather.FromSlice([]byte("wp7!")), blob.PutOptions{}))
+	blobtesting.AssertGetBlob(ctx, t, st, "wp7-blob", []byte("wp7!"))
+
+	// creating the same name again adopts the same folder instead of making a
+	// second one.
+	again := newOptions()
+
+	st2, err := New(ctx, again, true)
+	require.NoError(t, err)
+
+	defer st2.Close(ctx) //nolint:errcheck
+
+	require.Equal(t, opt.FolderID, again.FolderID, "a second create of the same name must reuse the folder")
+	blobtesting.AssertGetBlob(ctx, t, st2, "wp7-blob", []byte("wp7!"))
 }
 
 func TestGdriveStorageLiveCleanupOldData(t *testing.T) {

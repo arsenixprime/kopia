@@ -135,10 +135,21 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 		peakInFlight: map[string]int{},
 	}
 
+	// My Drive itself, under the alias Drive accepts wherever a folder ID is
+	// expected. Folder-by-name resolution both searches and creates here.
+	d.files[driveRootFolderAlias] = &fakeFile{
+		id:           driveRootFolderAlias,
+		name:         "My Drive",
+		mimeType:     folderMimeType,
+		createdTime:  clock.Now(),
+		modifiedTime: clock.Now(),
+	}
+
 	d.files[d.rootFolderID] = &fakeFile{
 		id:           d.rootFolderID,
 		name:         "kopia-fake-root",
 		mimeType:     folderMimeType,
+		parents:      []string{driveRootFolderAlias},
 		createdTime:  clock.Now(),
 		modifiedTime: clock.Now(),
 	}
@@ -154,17 +165,54 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 func (d *fakeDrive) options(t *testing.T, cacheDir string) *Options {
 	t.Helper()
 
-	testDriveTransports.Store(d.rootFolderID, testDriveTransport{
-		base:     d.server.Client().Transport,
-		endpoint: d.server.URL + "/drive/v3/",
-	})
-
-	t.Cleanup(func() { testDriveTransports.Delete(d.rootFolderID) })
+	d.registerTransport(t, d.rootFolderID)
 
 	return &Options{
 		FolderID: d.rootFolderID,
 		Tuning:   TuningOptions{CacheDir: cacheDir},
 	}
+}
+
+// optionsForFolderName returns Options that name a folder to be created rather
+// than an existing folder ID, and registers the transport override under the
+// key New uses while there is no ID yet.
+func (d *fakeDrive) optionsForFolderName(t *testing.T, cacheDir, folderName string) *Options {
+	t.Helper()
+
+	opt := &Options{
+		FolderName: folderName,
+		Tuning:     TuningOptions{CacheDir: cacheDir},
+	}
+
+	d.registerTransport(t, testTransportKey(opt))
+
+	return opt
+}
+
+// registerTransport points New at this fake server for one seam key (a folder
+// ID, or "name:<folder name>" while the folder is still to be created).
+func (d *fakeDrive) registerTransport(t *testing.T, key string) {
+	t.Helper()
+
+	testDriveTransports.Store(key, testDriveTransport{
+		base:     d.server.Client().Transport,
+		endpoint: d.server.URL + "/drive/v3/",
+	})
+
+	t.Cleanup(func() { testDriveTransports.Delete(key) })
+}
+
+// addRootFolder injects a folder in the root of My Drive directly, simulating
+// one left behind by an earlier run (or made by hand under --scope=drive).
+func (d *fakeDrive) addRootFolder(name string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.createFileLocked(fakeFileMetadata{
+		Name:     name,
+		MimeType: folderMimeType,
+		Parents:  []string{driveRootFolderAlias},
+	}, nil, clock.Now()).id
 }
 
 //
@@ -262,6 +310,19 @@ func (d *fakeDrive) fileIDsNamed(name string) []string {
 	sort.Strings(res)
 
 	return res
+}
+
+// parentsOf reports the parent folder IDs recorded for a file.
+func (d *fakeDrive) parentsOf(fileID string) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	f, ok := d.files[fileID]
+	if !ok {
+		return nil
+	}
+
+	return append([]string(nil), f.parents...)
 }
 
 //

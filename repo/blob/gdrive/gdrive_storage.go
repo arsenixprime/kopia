@@ -52,6 +52,27 @@ const (
 	// folderMimeType identifies a Drive folder, used when creating the
 	// per-repository folder from tests and tooling.
 	folderMimeType = "application/vnd.google-apps.folder"
+
+	// driveRootFolderAlias is the ID Drive accepts anywhere a folder ID is
+	// expected to mean "the root of the signed-in user's My Drive". It is where
+	// Options.FolderName resolution looks, and where a folder created from
+	// Options.FolderName is placed.
+	driveRootFolderAlias = "root"
+
+	// folderNameProbePageSize bounds how many same-named folders the name
+	// resolution looks at. More than one is already an error; the page size only
+	// decides how many IDs the error message can name.
+	folderNameProbePageSize = 100
+
+	// folderWriteFields is the files.create response mask when the repository
+	// folder itself is created: the ID is the answer, the name confirms what was
+	// made.
+	folderWriteFields = "id,name"
+
+	// folderLookupFields is the files.list mask of the folder-name query. The
+	// name is requested because Drive's `=` is case-insensitive and the match has
+	// to be re-checked exactly.
+	folderLookupFields = "files(" + folderWriteFields + ")"
 )
 
 // Tuning defaults. Every knob of Options.Tuning that is left at its zero value
@@ -258,6 +279,17 @@ type testDriveTransport struct {
 	endpoint string
 }
 
+// testTransportKey is the key a test registers its fake Drive under: the folder
+// ID normally, and the folder NAME prefixed with "name:" when the folder is
+// still to be created and therefore has no ID for either side to agree on yet.
+func testTransportKey(opt *Options) string {
+	if opt.FolderID != "" {
+		return opt.FolderID
+	}
+
+	return "name:" + opt.FolderName
+}
+
 // resolvedTuning is Options.Tuning with all defaults applied and all unit
 // conversions done, so that no hot path ever has to think about zero values.
 type resolvedTuning struct {
@@ -311,7 +343,15 @@ var _ blob.Storage = (*gdriveStorage)(nil)
 
 // New creates new Google Drive-backed storage with specified options:
 //
-// - the 'folderID' field is required and all other parameters are optional.
+// - the 'folderID' field is required and all other parameters are optional,
+// except that a repository being CREATED may name a folder to make instead:
+// with 'folderID' empty and 'folderName' set, New reuses or creates a folder of
+// that name in the root of My Drive and writes its ID into opt.FolderID, so
+// that everything downstream - this storage, its ConnectionInfo, the repository
+// config file and any repository token minted from it - names a concrete
+// folder. That is deliberately the ONLY mutation New makes to opt: the ID has
+// to be visible to the caller, because it is what another machine connects
+// with.
 //
 // Credentials are resolved by gdrive_auth.go: explicit service-account or
 // authorized-user JSON, an interactive OAuth sign-in against a client secret
@@ -323,10 +363,8 @@ var _ blob.Storage = (*gdriveStorage)(nil)
 // error (issue #2656), whereas the pacer classifies every failure through
 // gdriveerr and backs the whole account off when Drive asks it to.
 func New(ctx context.Context, opt *Options, isCreate bool) (blob.Storage, error) {
-	_ = isCreate
-
-	if opt.FolderID == "" {
-		return nil, errors.New("folder-id must be specified")
+	if err := validateFolderOptions(opt, isCreate); err != nil {
+		return nil, err
 	}
 
 	tuning := resolveTuning(opt)
@@ -335,6 +373,22 @@ func New(ctx context.Context, opt *Options, isCreate bool) (blob.Storage, error)
 	service, httpClient, err := newDriveService(ctx, opt, stats)
 	if err != nil {
 		return nil, err
+	}
+
+	pacer := gdrivepacer.New(tuning.pacer, stats)
+
+	if opt.FolderID == "" {
+		folderID, err := resolveFolderByName(ctx, service.Files, pacer, opt.FolderName)
+		if err != nil {
+			httpClient.CloseIdleConnections()
+
+			return nil, err
+		}
+
+		// Written back into the caller's options on purpose; see the doc comment.
+		// Everything below this line, and every consumer of ConnectionInfo, sees a
+		// storage that is indistinguishable from one opened with --folder-id.
+		opt.FolderID = folderID
 	}
 
 	idCache, err := newPersistentIDCache(ctx, tuning.cacheDir, opt.FolderID)
@@ -351,7 +405,7 @@ func New(ctx context.Context, opt *Options, isCreate bool) (blob.Storage, error)
 		folderID:   opt.FolderID,
 		tuning:     tuning,
 		stats:      stats,
-		pacer:      gdrivepacer.New(tuning.pacer, stats),
+		pacer:      pacer,
 		idCache:    idCache,
 		deleteSem:  make(chan struct{}, tuning.deleteParallelism),
 	}
@@ -414,6 +468,171 @@ func (s *gdriveStorage) verifyConnection(ctx context.Context) error {
 
 	if _, err := s.pacedListByName(ctx, methodFilesList, probe, nameLookupFields, nameProbePageSize); err != nil {
 		return errors.Wrap(err, "unable to list from the folder")
+	}
+
+	return nil
+}
+
+//
+// ------------------------------------------------------- folder by name
+//
+
+// validateFolderOptions decides which of the two ways of naming the repository
+// folder is in play, and rejects the combinations that cannot mean anything.
+//
+// FolderID always wins when it is set: after a create-by-name the configuration
+// carries BOTH fields - the ID because it is what every later connection uses,
+// the name only as a record of provenance - so the two being present together
+// is the normal steady state, not a conflict. The conflict that IS worth
+// refusing (a user passing both on the command line) is caught at the CLI
+// layer, where the two flags are still distinguishable from a config file.
+func validateFolderOptions(opt *Options, isCreate bool) error {
+	if opt.FolderID != "" {
+		return nil
+	}
+
+	switch {
+	case opt.FolderName == "":
+		return errors.New("folder-id must be specified")
+
+	case strings.TrimSpace(opt.FolderName) == "":
+		return errors.New("the Google Drive folder name must not be blank")
+
+	case opt.ReadOnly:
+		return errors.New("a read-only connection cannot create the Google Drive folder: specify folder-id instead")
+
+	case !isCreate:
+		return errors.Errorf("the Google Drive folder %q can only be created while creating a repository; connect to an existing repository with folder-id", opt.FolderName)
+	}
+
+	return nil
+}
+
+// resolveFolderByName turns Options.FolderName into a folder ID, creating the
+// folder in the root of My Drive if it is not there yet.
+//
+// This is what makes a Drive repository deployable with nothing but the kopia
+// binary. Under the default drive.file scope Kopia can only ever see files it
+// created itself, so a folder made by hand in the web UI is invisible to it;
+// before this existed the only way to obtain an app-owned folder was to make
+// one with some other tool that held the same OAuth client.
+//
+// It is idempotent on purpose: re-running the same create against the same
+// account reuses the folder rather than accumulating same-named siblings (Drive
+// permits any number of them). Two or more matches is the one case that cannot
+// be resolved safely, because picking one would silently split a repository
+// across folders, so it is an error that names the candidates.
+func resolveFolderByName(ctx context.Context, files *drive.FilesService, pacer *gdrivepacer.Pacer, folderName string) (string, error) {
+	name := strings.TrimSpace(folderName)
+
+	existing, err := findFoldersNamed(ctx, files, pacer, name)
+	if err != nil {
+		return "", err
+	}
+
+	if len(existing) > 1 {
+		ids := make([]string, 0, len(existing))
+		for _, f := range existing {
+			ids = append(ids, f.Id)
+		}
+
+		slices.Sort(ids)
+
+		return "", errors.Errorf("found %v Google Drive folders named %q in the root of My Drive (IDs %v); rename or remove all but one, or select the one you want with folder-id",
+			len(existing), name, strings.Join(ids, ", "))
+	}
+
+	if len(existing) == 1 {
+		log(ctx).Infof("Reusing the existing Google Drive folder %q, ID %v.", name, existing[0].Id)
+
+		return existing[0].Id, nil
+	}
+
+	var created *drive.File
+
+	if err := pacer.Call(ctx, methodFilesCreate, "", func() error {
+		var cerr error
+
+		created, cerr = files.Create(&drive.File{
+			Name:     name,
+			MimeType: folderMimeType,
+			Parents:  []string{driveRootFolderAlias},
+		}).SupportsAllDrives(true).Fields(folderWriteFields).Context(ctx).Do()
+
+		//nolint:wrapcheck // the pacer classifies this error through gdriveerr.
+		return cerr
+	}); err != nil {
+		return "", errors.Wrapf(err, "unable to create the Google Drive folder %q", name)
+	}
+
+	// Read the folder back before anything is written into it. A create that
+	// reports success and a folder that is not subsequently readable would
+	// otherwise surface much later, as a confusing failure of the connection
+	// probe against an ID the user has already been told to reuse.
+	if err := verifyFolderVisible(ctx, files, pacer, created.Id); err != nil {
+		return "", errors.Wrapf(err, "created the Google Drive folder %q (ID %v), but it is not readable", name, created.Id)
+	}
+
+	log(ctx).Infof("Created the Google Drive folder %q, ID %v.", name, created.Id)
+
+	return created.Id, nil
+}
+
+// findFoldersNamed returns the folders of exactly that name in the root of My
+// Drive that this application is allowed to see. Under drive.file that is only
+// the ones it created, which is precisely the set a previous run of this code
+// could have left behind.
+func findFoldersNamed(ctx context.Context, files *drive.FilesService, pacer *gdrivepacer.Pacer, name string) ([]*drive.File, error) {
+	q := fmt.Sprintf("'%s' in parents and name = '%s' and mimeType = '%s' and trashed = false",
+		driveRootFolderAlias, escapeQueryLiteral(name), folderMimeType)
+
+	var res *drive.FileList
+
+	if err := pacer.Call(ctx, methodFilesList, "", func() error {
+		var lerr error
+
+		res, lerr = files.List().
+			SupportsAllDrives(true).
+			IncludeItemsFromAllDrives(true).
+			Q(q).
+			PageSize(folderNameProbePageSize).
+			Fields(googleapi.Field(folderLookupFields)).
+			Context(ctx).
+			Do()
+
+		//nolint:wrapcheck // the pacer classifies this error through gdriveerr.
+		return lerr
+	}); err != nil {
+		return nil, errors.Wrapf(err, "unable to look for a Google Drive folder named %q", name)
+	}
+
+	// Drive's `=` is CASE-INSENSITIVE (RECON.md B.5.3), so this query can return
+	// a "Kopia" when asked for "kopia". Reusing one of those would put the
+	// repository somewhere the user did not name.
+	return slices.DeleteFunc(res.Files, func(f *drive.File) bool {
+		return f.Name != name
+	}), nil
+}
+
+// verifyFolderVisible is the files.get half of what verifyConnection does,
+// applied to a folder that has just been created.
+func verifyFolderVisible(ctx context.Context, files *drive.FilesService, pacer *gdrivepacer.Pacer, folderID string) error {
+	var f *drive.File
+
+	if err := pacer.Call(ctx, methodFilesGet, "", func() error {
+		var gerr error
+
+		f, gerr = files.Get(folderID).SupportsAllDrives(true).Fields("id,mimeType").Context(ctx).Do()
+
+		//nolint:wrapcheck // the pacer classifies this error through gdriveerr.
+		return gerr
+	}); err != nil {
+		//nolint:wrapcheck // the pacer returns a *gdriveerr.DriveError that already names the operation and the Drive reason.
+		return err
+	}
+
+	if f.MimeType != folderMimeType {
+		return errors.Errorf("Google Drive item %v is not a folder (it is %v)", folderID, f.MimeType)
 	}
 
 	return nil
@@ -515,7 +734,7 @@ func newDriveService(ctx context.Context, opt *Options, stats *TransportStats) (
 }
 
 func newBaseTransport(ctx context.Context, opt *Options) (http.RoundTripper, string, error) {
-	if v, ok := testDriveTransports.Load(opt.FolderID); ok {
+	if v, ok := testDriveTransports.Load(testTransportKey(opt)); ok {
 		t, _ := v.(testDriveTransport)
 
 		return t.base, t.endpoint, nil

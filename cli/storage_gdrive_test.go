@@ -17,6 +17,19 @@ import (
 func parseGDriveFlags(t *testing.T, args ...string) *storageGDriveFlags {
 	t.Helper()
 
+	c := parseGDriveFlagsRaw(t, append([]string{"--folder-id", "some-folder"}, args...)...)
+
+	// same fold-in that Connect() performs before handing the options to the backend.
+	c.applyOptionalTuningFlags()
+
+	return c
+}
+
+// parseGDriveFlagsRaw is parseGDriveFlags without the implied --folder-id, for
+// the tests that are about how the folder is named in the first place.
+func parseGDriveFlagsRaw(t *testing.T, args ...string) *storageGDriveFlags {
+	t.Helper()
+
 	c := &storageGDriveFlags{}
 
 	app := kingpin.New("test", "test")
@@ -25,11 +38,8 @@ func parseGDriveFlags(t *testing.T, args ...string) *storageGDriveFlags {
 	cmd := app.Command("connect", "").Command("gdrive", "")
 	c.Setup(nil, cmd)
 
-	_, err := app.Parse(append([]string{"connect", "gdrive", "--folder-id", "some-folder"}, args...))
+	_, err := app.Parse(append([]string{"connect", "gdrive"}, args...))
 	require.NoError(t, err)
-
-	// same fold-in that Connect() performs before handing the options to the backend.
-	c.applyOptionalTuningFlags()
 
 	return c
 }
@@ -110,4 +120,86 @@ func TestGDriveUseBatchDeleteIsTriState(t *testing.T) {
 
 func ptrTo[T any](v T) *T {
 	return &v
+}
+
+// TestGDriveCreateFolderNameSetsTheOption: at create time the flag becomes
+// Options.FolderName, which is what makes the backend resolve or create the
+// folder. The name is trimmed, because it ends up in a Drive query.
+func TestGDriveCreateFolderNameSetsTheOption(t *testing.T) {
+	c := parseGDriveFlagsRaw(t, "--create-folder-name", "  my-backups  ")
+
+	require.NoError(t, c.applyFolderFlags(true))
+	require.Equal(t, "my-backups", c.options.FolderName)
+	require.Empty(t, c.options.FolderID)
+}
+
+// TestGDriveFolderFlagsRejected covers every combination the two folder flags
+// can be given in that cannot mean anything.
+func TestGDriveFolderFlagsRejected(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		isCreate bool
+		wantErr  string
+	}{
+		{
+			name:     "neither flag",
+			isCreate: true,
+			wantErr:  "--folder-id must be specified",
+		},
+		{
+			name:    "neither flag on connect",
+			wantErr: "--folder-id must be specified",
+		},
+		{
+			name:     "both flags",
+			args:     []string{"--folder-id", "some-folder", "--create-folder-name", "my-backups"},
+			isCreate: true,
+			wantErr:  "mutually exclusive",
+		},
+		{
+			name:    "create-folder-name on connect",
+			args:    []string{"--create-folder-name", "my-backups"},
+			wantErr: "only supported by 'kopia repository create'",
+		},
+		{
+			name:     "blank name",
+			args:     []string{"--create-folder-name", "   "},
+			isCreate: true,
+			wantErr:  "must not be blank",
+		},
+		{
+			name:     "read-only",
+			args:     []string{"--create-folder-name", "my-backups", "--read-only"},
+			isCreate: true,
+			wantErr:  "--read-only",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := parseGDriveFlagsRaw(t, tc.args...)
+
+			err := c.applyFolderFlags(tc.isCreate)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+			require.Empty(t, c.options.FolderName, "a rejected command line must not reach the backend")
+		})
+	}
+}
+
+// TestGDriveFolderIDAloneIsAccepted: the ordinary path is untouched, on both
+// create and connect, and leaves no folderName in the configuration.
+func TestGDriveFolderIDAloneIsAccepted(t *testing.T) {
+	for _, isCreate := range []bool{true, false} {
+		c := parseGDriveFlagsRaw(t, "--folder-id", "some-folder")
+
+		require.NoError(t, c.applyFolderFlags(isCreate))
+		require.Equal(t, "some-folder", c.options.FolderID)
+		require.Empty(t, c.options.FolderName)
+
+		j, err := json.Marshal(c.options)
+		require.NoError(t, err)
+		require.NotContains(t, string(j), "folderName")
+	}
 }

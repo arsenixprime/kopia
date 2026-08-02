@@ -13,6 +13,20 @@ type Options struct {
 	// FolderId is Google Drive's ID of a folder where data is stored.
 	FolderID string `json:"folderID"`
 
+	// FolderName names the folder in the root of My Drive that holds the
+	// repository. It is used ONLY when FolderID is empty and the repository is
+	// being created: the backend then reuses the folder of that name if it can
+	// see exactly one, creates it otherwise, and writes the resulting ID into
+	// FolderID before the connection info is serialized. From that moment on
+	// FolderID is the operative field and this one is kept purely as a record of
+	// how the folder came to be - which is what lets a second machine connect
+	// with nothing but the folder ID.
+	//
+	// A folder created this way is owned by the application, so it is visible
+	// under the default "drive.file" scope, unlike a folder made by hand in the
+	// Drive web UI.
+	FolderName string `json:"folderName,omitempty"`
+
 	// ServiceAccountCredentialsFile specifies the name of the file with Drive credentials.
 	ServiceAccountCredentialsFile string `json:"credentialsFile,omitempty"`
 

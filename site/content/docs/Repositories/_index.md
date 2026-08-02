@@ -246,7 +246,7 @@ storage.objects.setRetention
 
 Kopia supports Google Drive in two ways: natively and through Kopia's [Rclone `repository` option](#rclone). Native Google Drive support is currently only available through Kopia CLI; Kopia GUI users need to use Kopia's [Rclone `repository` option](#rclone).
 
-Kopia uses a Google Drive folder to store all the files in the `repository`. Kopia will only access files in this folder, and using Kopia does not impact your other Google Drive files. It is recommended that you let Kopia manage this folder and do not upload any other content to this folder.
+Kopia uses a Google Drive folder to store all the files in the `repository`. Kopia will only access files in this folder, and using Kopia does not impact your other Google Drive files. It is recommended that you let Kopia manage this folder and do not upload any other content to this folder. Kopia can create the folder for you (`--create-folder-name`), which is the recommended way to set up the first machine; you can also point it at a folder that already exists (`--folder-id`).
 
 Before you create a Google Drive `repository`, you have to decide how Kopia signs in to Google. There are three ways, and the choice matters a lot -- it decides who owns the backup files, whose storage quota they consume, and how much of your Drive Kopia is able to see:
 
@@ -278,11 +278,11 @@ Continuing from the project you created above:
 
 4. Create the OAuth client (`APIs & Services` -> `Credentials` -> `Create credentials` -> `OAuth client ID`). Choose the `Desktop app` application type. Download the resulting JSON file -- it is the document with an `installed` (or `web`) section in it -- and save it on the machine that will run Kopia.
 
-5. Create the `repository`, pointing Kopia at that file:
+5. Create the `repository`, pointing Kopia at that file and telling it what to call the folder it should make for you:
 
 ```shell
 $ kopia repository create gdrive \
-        --folder-id=z63ZZ1Npv3OFvDPwU3dX0w \
+        --create-folder-name=my-kopia-backups \
         --client-credentials-file="<where-you-have-stored-the-oauth-client-json>"
 ```
 
@@ -290,9 +290,20 @@ Kopia prints a Google sign-in URL and waits. Open the URL in a browser (on any m
 
 You will be asked to enter the repository password that you want. Remember, this [password is used to encrypt your data](../faqs/#how-do-i-enable-encryption), so make sure it is a secure password!
 
-> NOTE: By default Kopia asks Google only for the `drive.file` scope, which lets it see and modify **only the files and folders it created itself** -- it is not able to read the rest of your Drive even if it wanted to. The flip side is that a folder you created by hand in the Drive web UI is invisible to Kopia: a `--folder-id` naming such a folder fails at connect time with "unable to open the Google Drive folder", even though you can see the folder perfectly well in your browser. See [choosing a scope](#choosing-a-scope).
+`--create-folder-name` makes a folder of that name in the root of your Drive (`My Drive`) and puts the repository in it. Kopia prints the ID of the folder it made and saves it in the repository configuration:
 
-> PRO TIP: Kopia does not create the repository folder for you -- `--folder-id` must name a folder that already exists and that Kopia is permitted to see. If you want the repository to live in a folder you made yourself in the Drive web UI, which is the usual case, pass `--scope=drive` on every `create` and `connect` for that repository.
+```
+Created the Google Drive folder "my-kopia-backups", ID 1BTGFd7qG9CWiaJdN6WbUCdTYzdQXEbhr.
+Google Drive folder "my-kopia-backups" has ID 1BTGFd7qG9CWiaJdN6WbUCdTYzdQXEbhr - connect other machines with: kopia repository connect gdrive --folder-id 1BTGFd7qG9CWiaJdN6WbUCdTYzdQXEbhr
+```
+
+**Write that folder ID down**: it is what every other machine uses to reach the same repository, with `kopia repository connect gdrive --folder-id=...`. You can also read it back at any time with `kopia repository status`.
+
+Running the same `create --create-folder-name` again is safe: if Kopia can already see exactly one folder of that name it reuses it rather than making a second one, and then refuses to create a repository over the data that is already there.
+
+> NOTE: By default Kopia asks Google only for the `drive.file` scope, which lets it see and modify **only the files and folders it created itself** -- it is not able to read the rest of your Drive even if it wanted to. That is exactly why `--create-folder-name` is the recommended way to start: a folder Kopia makes for itself is one it can see. A folder you created by hand in the Drive web UI is *not*, and a `--folder-id` naming such a folder fails at connect time with "unable to open the Google Drive folder", even though you can see the folder perfectly well in your browser. See [choosing a scope](#choosing-a-scope).
+
+> PRO TIP: If you would rather put the repository in a folder you made yourself in the Drive web UI, name it with `--folder-id` instead of `--create-folder-name`, and pass `--scope=drive` on every `create` and `connect` for that repository -- otherwise Kopia cannot see it. `--folder-id` and `--create-folder-name` are mutually exclusive, and `--create-folder-name` is only accepted by `repository create`; there is nothing to create when you are connecting to a repository that already exists.
 
 The same OAuth client JSON works on every machine you back up. Copy it around freely; it is a client identifier, not a password, and each machine performs its own sign-in against it.
 
@@ -316,18 +327,18 @@ Continuing from the project you created above:
 
 ```shell
 $ kopia repository create gdrive \
-        --folder-id=z63ZZ1Npv3OFvDPwU3dX0w \
+        --create-folder-name=my-kopia-backups \
         --credentials-file="<where-you-have-stored-the-json-key-file>" \
         --impersonate-user=backups@example.com
 ```
 
-Everything Kopia writes is owned by `backups@example.com` and counts against that user's storage, exactly as if that user had run Kopia. No browser is involved at any point.
+Everything Kopia does here is done as `backups@example.com`, exactly as if that user had run Kopia: the folder is created in that user's own `My Drive`, everything Kopia writes is owned by them, and it counts against their storage. No browser is involved at any point. Use `--folder-id` instead of `--create-folder-name` if the repository must live in a folder that already exists.
 
 #### Option 3: A bare service account
 
 > WARNING: A service account is its own Drive user with roughly 15 GB of storage that **cannot be increased or purchased**. If you point Kopia at a folder in the service account's own Drive, your backups will stop working when they hit that ceiling. Kopia prints a warning at connect time when it detects this configuration.
 
-This method is only appropriate when the repository lives on a **Shared Drive**, whose storage belongs to the organization rather than to the service account. Follow steps 3 and 4 of [option 2](#option-2-service-account-with-domain-wide-delegation) to create the service account and its JSON key, create a folder on a Shared Drive, add the service account email as a member of that Shared Drive with `Content manager` (or higher) access, and then:
+This method is only appropriate when the repository lives on a **Shared Drive**, whose storage belongs to the organization rather than to the service account. `--create-folder-name` is not the right tool here -- it creates in the root of `My Drive`, which for a bare service account is the 15 GB drive you are trying to avoid. Follow steps 3 and 4 of [option 2](#option-2-service-account-with-domain-wide-delegation) to create the service account and its JSON key, create a folder on a Shared Drive, add the service account email as a member of that Shared Drive with `Content manager` (or higher) access, and then:
 
 ```shell
 $ kopia repository create gdrive \
@@ -343,7 +354,7 @@ If this fails with "unable to open the Google Drive folder", the folder is not v
 
 The `--scope` flag selects which Google Drive OAuth scope Kopia requests:
 
-* `--scope=drive.file` (the default) grants Kopia access to **only the files and folders it created itself**. This is a non-sensitive scope, so an app using it never needs to pass Google's app-verification or third-party security-assessment process. A folder created outside Kopia -- in the Drive web UI, or by another Kopia installation signed in as a different user -- is invisible to Kopia under this scope, and a `files.get` on it returns "not found".
+* `--scope=drive.file` (the default) grants Kopia access to **only the files and folders it created itself**. This is a non-sensitive scope, so an app using it never needs to pass Google's app-verification or third-party security-assessment process. A folder created outside Kopia -- in the Drive web UI, or by another Kopia installation signed in as a different user -- is invisible to Kopia under this scope, and a `files.get` on it returns "not found". `--create-folder-name` avoids the problem entirely: a folder Kopia creates is a folder Kopia can see, so the default scope is enough for the whole life of the repository.
 * `--scope=drive` grants full read/write access to **every file in the Drive of the account that signs in**. Use it only when the repository must live in a pre-existing, externally created folder. Note that `drive` is one of Google's restricted scopes, so an app distributed under it would need Google's security assessment; that does not apply to an `Internal` Workspace app or to a personal-use `External` app with test users, but it is the reason `drive.file` is the default.
 
 `--read-only` is orthogonal and takes precedence over both: it requests `drive.readonly` so that the connection cannot mutate anything.
@@ -362,7 +373,15 @@ Deleting the token cache file simply causes the next connection to prompt for si
 
 #### Connecting to Repository
 
-After you have created the `repository`, you connect to it using the [`kopia repository connect gdrive` command](../reference/command-line/common/repository-connect-gdrive/), which takes the same authentication flags as `create`. Read the [help docs](../reference/command-line/common/repository-connect-gdrive/) for more information on the options available for this command.
+After you have created the `repository`, you connect to it using the [`kopia repository connect gdrive` command](../reference/command-line/common/repository-connect-gdrive/), which takes the same authentication flags as `create`. Connecting always names the folder by ID -- there is no `--create-folder-name` on `connect`, because the folder already exists:
+
+```shell
+$ kopia repository connect gdrive \
+        --folder-id=1BTGFd7qG9CWiaJdN6WbUCdTYzdQXEbhr \
+        --client-credentials-file="<where-you-have-stored-the-oauth-client-json>"
+```
+
+That is the ID printed when the repository was created; `kopia repository status` shows it on a machine that is already connected. Read the [help docs](../reference/command-line/common/repository-connect-gdrive/) for more information on the options available for this command.
 
 If you view your folder on Google Drive, you should see that Kopia has created the skeleton of the repository with a `kopia.repository` file and a couple of others. Kopia will store all the files for your snapshots in this folder.
 

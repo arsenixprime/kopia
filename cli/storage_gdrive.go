@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/pkg/errors"
@@ -19,6 +20,14 @@ type storageGDriveFlags struct {
 
 	embedCredentials bool
 
+	// createFolderName holds --create-folder-name. It is not bound directly to
+	// gdrive.Options.FolderName because the two are not the same thing: the flag
+	// is a request to make a folder, which only 'repository create' can honor,
+	// while the option is also what a configuration written by an earlier create
+	// carries forever afterwards. Keeping them apart is what lets Connect tell a
+	// user asking for a new folder from a machine reconnecting to an old one.
+	createFolderName string
+
 	// useBatchDelete is an optional boolean. gdrive.TuningOptions.UseBatchDelete is
 	// a *bool where nil means "let the backend decide", so the flag must be able to
 	// tell "not specified" from "specified false". The CLI does that with a bool
@@ -27,8 +36,24 @@ type storageGDriveFlags struct {
 	useBatchDelete []bool
 }
 
+// Setup registers the provider's flags. It is called once per command that can
+// open a storage - 'repository create', 'connect', 'sync-to' and 'repair' - and
+// is given no way to tell them apart; the create/connect distinction arrives
+// later, as the isCreate argument of Connect. --create-folder-name is therefore
+// registered everywhere and refused at Connect time on every command but
+// create, which is the same shape as --point-in-time on the azure, s3 and gcs
+// providers.
+//
+// --folder-id consequently cannot stay Required(): a create that names a folder
+// to make does not have an ID to give. The requirement is enforced in Connect
+// instead, where it can say which of the two flags is missing.
 func (c *storageGDriveFlags) Setup(_ StorageProviderServices, cmd *kingpin.CmdClause) {
-	cmd.Flag("folder-id", "FolderID to use for objects in the bucket").Required().StringVar(&c.options.FolderID)
+	cmd.Flag("folder-id", "FolderID to use for objects in the bucket").StringVar(&c.options.FolderID)
+	cmd.Flag("create-folder-name",
+		"Create (or reuse) a folder of this name in the root of My Drive and put the repository in it, instead of naming an existing "+
+			"folder with --folder-id. Only valid when creating a repository. The resulting folder ID is printed and saved in the "+
+			"configuration; other machines connect to the repository with --folder-id.").
+		PlaceHolder("NAME").StringVar(&c.createFolderName)
 	cmd.Flag("read-only", "Use read-only scope to prevent write access").BoolVar(&c.options.ReadOnly)
 	cmd.Flag("credentials-file", "Use the provided JSON file with credentials").ExistingFileVar(&c.options.ServiceAccountCredentialsFile)
 	cmd.Flag("embed-credentials", "Embed GCS credentials JSON in Kopia configuration").BoolVar(&c.embedCredentials)
@@ -92,10 +117,44 @@ func (c *storageGDriveFlags) applyOptionalTuningFlags() {
 	}
 }
 
+// applyFolderFlags validates the two mutually exclusive ways of naming the
+// repository folder and folds --create-folder-name into the options.
+func (c *storageGDriveFlags) applyFolderFlags(isCreate bool) error {
+	if c.createFolderName == "" {
+		if c.options.FolderID == "" {
+			return errors.New("--folder-id must be specified")
+		}
+
+		return nil
+	}
+
+	switch {
+	case !isCreate:
+		return errors.New("--create-folder-name is only supported by 'kopia repository create': connect to an existing repository with --folder-id")
+
+	case c.options.FolderID != "":
+		return errors.New("--create-folder-name and --folder-id are mutually exclusive: the first makes a folder, the second names one that exists")
+
+	case strings.TrimSpace(c.createFolderName) == "":
+		return errors.New("--create-folder-name must not be blank")
+
+	case c.options.ReadOnly:
+		return errors.New("--create-folder-name cannot be combined with --read-only: a read-only connection cannot create anything")
+	}
+
+	c.options.FolderName = strings.TrimSpace(c.createFolderName)
+
+	return nil
+}
+
 func (c *storageGDriveFlags) Connect(ctx context.Context, isCreate bool, formatVersion int) (blob.Storage, error) {
 	_ = formatVersion
 
 	c.applyOptionalTuningFlags()
+
+	if err := c.applyFolderFlags(isCreate); err != nil {
+		return nil, err
+	}
 
 	if c.embedCredentials {
 		data, err := os.ReadFile(c.options.ServiceAccountCredentialsFile)
@@ -107,8 +166,22 @@ func (c *storageGDriveFlags) Connect(ctx context.Context, isCreate bool, formatV
 		c.options.ServiceAccountCredentialsFile = ""
 	}
 
-	//nolint:wrapcheck
-	return gdrive.New(ctx, &c.options, isCreate)
+	st, err := gdrive.New(ctx, &c.options, isCreate)
+	if err != nil {
+		//nolint:wrapcheck
+		return nil, err
+	}
+
+	if c.options.FolderName != "" {
+		// gdrive.New has resolved the name into a concrete folder ID, which is the
+		// only thing another machine needs in order to connect to this repository.
+		// It is saved in the configuration, but a user who has just created the
+		// repository should not have to go looking for it there.
+		log(ctx).Infof("Google Drive folder %q has ID %v - connect other machines with: kopia repository connect gdrive --folder-id %v",
+			c.options.FolderName, c.options.FolderID, c.options.FolderID)
+	}
+
+	return st, nil
 }
 
 func init() {
