@@ -5,7 +5,32 @@
 
 ## Current Phase
 
-**Phase 1 — Error taxonomy** (started 2026-08-01)
+**Phase 3 — Benchmark & comparison framework** (started 2026-08-01)
+
+Phase 2 GATE PASSED 2026-08-01 (EM-run, real Drive, kopia binary built from
+62f35a2d): `kopia repository validate-provider` → "All good." in 56s incl.
+30s concurrency test (the #3788 + #4272 scenarios); e2e cycle in folder
+kopia-e2e-gate (1vQOJWfgRGK_uG5V3NVfBkv9eyzBsKWa8): create → initial
+snapshot 335MB/1200 files 71s → mutate → incremental 14s → verify 100%
+(368MB downloaded) 117s → restore 1.2s (cache-warm) byte-identical →
+full maintenance 13.5s. WP-2e merged 62f35a2d with live datapoints:
+batch delete LOSES ~2.5x to parallel singles (Drive runs batch parts
+serially; parallel singles 19.5 blobs/s vs batch 8.6 at default pacer) —
+default stays parallel; absent-blob lookup 5.35s→0.48s; server-side name
+narrowing for prefixes ≥4 chars (epoch/log/format listings no longer page
+whole repo); BONUS FIX: Drive name= is case-insensitive → exact-name
+client filter (wrong-blob-bytes hazard).
+
+**Phase 2 — Backend rewrite** (COMPLETE)
+
+Phase 1 GATE PASSED 2026-08-01: repo/blob/gdrive/gdriveerr merged @ 861eabe1.
+368 tests green (also -race), golangci-lint 2.6.1 clean, builds under both
+tag sets. Superset of RECON C.5 incl. live-observed accessNotConfigured +
+oauth2.RetrieveError(invalid_grant). Key reviewed deviations accepted:
+unknown errors default RetryableResume; hierarchy-depth = NonRetryableOther
+not FatalQuota; Fields() = zap-style k/v pairs. Design note: backend must
+NOT rely on repo/blob/retrying (can't see ErrStorageQuotaExhausted, can't
+honor Retry-After) — pacer is the retry layer (PHASE2_DESIGN.md Contract 1).
 
 Phase 0 GATE PASSED 2026-08-01: RECON.md (repo root, 1805 lines) assembled
 from R1+R2+R3; all mandated items answered with file:line refs and doc URLs.
@@ -20,13 +45,72 @@ reviews RECON.md against the gate checklist.
 | Phase | Gate | Status |
 |-------|------|--------|
 | 0 Recon | RECON.md complete w/ file:line refs + doc URLs | PASSED 2026-08-01 |
-| 1 Error taxonomy | taxonomy merged, unit tests green, covers all reasons from RECON | IN PROGRESS |
-| 2 Backend rewrite | provider suite green (mock) + validate-provider clean vs real Drive + e2e snapshot cycle | not started |
+| 1 Error taxonomy | taxonomy merged, unit tests green, covers all reasons from RECON | PASSED 2026-08-01 (commit 861eabe1) |
+| 2 Backend rewrite | provider suite green (mock) + validate-provider clean vs real Drive + e2e snapshot cycle | PASSED 2026-08-01 (62f35a2d) |
 | 3 Benchmark framework | one interleaved native-vs-rclone report promoted to curated results | not started |
 | 4 Tuning loop | TUNING.md + one documented cycle in TUNING_LOG.md | not started |
 | 5 Upstream prep | PR branch, docs, changelog ready | not started |
 
 ## Work Packages
+
+### Phase 2 wave 1 (dispatched 2026-08-01)
+- **WP-PACER** — repo/blob/gdrive/gdrivepacer/: adaptive rate limiter per
+  Contract 1. Status: DONE 2026-08-01, EM-verified (race tests, vet, fmt,
+  go.mod untouched); ACCEPTED pending wave-1 integration build. Accepted
+  deviations: Retry-After honored uncapped; RetryableResume delays are
+  call-local (no global barrier); ladder shape = package constants (only
+  the 4 Contract-5 knobs exposed).
+- **WP-INSTR** — gdrive_transport.go: counting RoundTripper + Stats per
+  Contract 2. Status: DONE 2026-08-01, EM-verified (race tests pass in live
+  tree, fmt clean, go.mod untouched); ACCEPTED pending wave-1 integration
+  build. Accepted deviations: per-bucket latency []int64 + shared bucket
+  array (diffable JSON); MethodStats adds Backoffs/BackoffMS/LatencySumMS;
+  transport-level errors recorded as fixed "transport_error" (url.Error
+  text can embed query-borne tokens). NOTE: wiring onto the Drive service
+  deliberately deferred to WP-2c. WP-INSTR pre-reported 11 lint issues in
+  WP-2a's in-progress files — check resolved at WP-2a review.
+- **WP-2a** — gdrive_auth.go + options/CLI additions: three auth modes per
+  Contract 4. Status: DONE 2026-08-01, EM-verified (live token test PASS
+  against real Drive, lint exit 0, additive-only diffs). Accepted
+  deviations: tuning tagged omitzero (omitempty inert on structs — literal
+  Contract-5 tag would emit "tuning":{} in every config); hand-built
+  authorized_user token source + own client-JSON parser (deprecated/
+  insufficient library funcs, go.mod frozen); impersonation errors loudly
+  when combined with non-SA credential modes. Impersonation path NOT
+  live-validated (no DWD configured); interactive flows covered by
+  fake-Google tests only (no KOPIA_GDRIVE_TEST_CLIENT_CREDENTIALS).
+
+WAVE 1 INTEGRATED 2026-08-01: commits d416be9a (pacer), 07d714af
+(transport), 2c282639 (auth). Full-tree builds both tag sets, all package
+tests -race green, live auth test green, golangci-lint 2.6.1 exit 0.
+
+### Phase 2 wave 2 (dispatched 2026-08-01)
+- **WP-2b** — gdrive_fileids.go: persistent blobID→fileID cache per
+  Contract 3. Status: DONE 2026-08-01, EM-verified, merged 4c72c7bc.
+  CRC32C append-only journal + flock + O_APPEND + SameFile reopen guard;
+  refcounted shared-instance registry (#4272 fix); multi-process test
+  re-execs test binary (guards proven load-bearing). Accepted deviations:
+  gofrs/flock (existing kopia dep), write-failure disables persistence
+  for process, tombstones persist past entry cap, interface declaration
+  deferred to WP-2c.
+- **WP-2c** — gdrive_storage.go full rewrite (incl. folded-in WP-2d
+  conditional create), legacy cache deletion, fake-Drive test server.
+  Status: DONE 2026-08-01, EM-verified, merged 6da6bf7b. Mock suite
+  (VerifyStorage + ValidateProvider + VerifyConcurrentAccess) green -race;
+  LIVE ValidateProvider PASS vs real Drive (49s, zero retries needed).
+  All §A.2.5 legacy defects addressed (checklist in agent report).
+  Live finding: files.list on nonexistent parent returns EMPTY not error
+  → liveness probe now files.get on folder. Accepted deviations incl.
+  cached-ID fast-path delete (single file), orderBy name,createdTime desc
+  dedupe, test seam sync.Map (flag for Phase 5 upstream review).
+  FLAGGED → WP-2e: 5s not-found escalation budget costs ~10s per
+  genuinely-absent blob lookup while live evidence shows escalation never
+  fired; reduce budget + add cache journal tail re-read on miss.
+- **WP-2e** — bulk deletes + listing optimization + not-found budget.
+  Status: DISPATCHED
+
+### Phase 1 (dispatched 2026-08-01)
+- **WP1 — gdriveerr taxonomy**: DONE, merged 861eabe1 (see gate note).
 
 ### Phase 0 (dispatched 2026-08-01)
 - **R1 — Kopia internals recon**: blob.Storage semantics, PutOptions, sentinel
@@ -74,6 +158,11 @@ reviews RECON.md against the gate checklist.
 
 ## Decisions Log
 
+- 2026-08-01: WP-2d (conditional create) FOLDED INTO WP-2c — the
+  DoNotRecreate protocol lives inside PutBlob; a separate package would
+  force a second rewrite of the same function. 2d's acceptance criteria
+  (emulation semantics + #3788/#4272 validation) reviewed as part of 2c +
+  the phase-gate live validate-provider run.
 - 2026-08-01: Phase 0 split 1→3 parallel recon agents (EM assembles RECON.md).
 - 2026-08-01: Noted current backend already has a fileID cache
   (repo/blob/gdrive/file_id_cache.go) — Phase 2b must evaluate/replace, not
@@ -128,4 +217,24 @@ reviews RECON.md against the gate checklist.
 
 ## Benchmark Baselines
 
-None yet (Phase 3).
+Informal Phase-2 gate numbers (real Drive, drive.file, dedicated OAuth
+client, 2026-08-01, single trial — NOT statistical baselines):
+- validate-provider 56s incl. 30s concurrency soak
+- initial snapshot 335MB/1200 files: 71s; incremental (+50 files): 14s
+- verify --verify-files-percent=100 (368MB down): 117s
+- full maintenance (small repo): 13.5s
+- deletes: parallel singles 19.5-23 blobs/s; batch 7.6-8.6 blobs/s
+Formal interleaved baselines land in $KOPIA_GDRIVE_BENCH_RESULTS (Phase 3).
+
+## Phase 3 environment notes
+
+- rclone NOT installed, no remotes (checked 2026-08-01). No user action
+  needed: synthesize rclone.conf from the authorized_user token (client_id/
+  client_secret/refresh_token) + scope drive.file + root_folder_id; fetch
+  rclone binary into scratchpad/tools. KOPIA_GDRIVE_TEST_FOLDER_RCLONE is
+  hand-created → INVISIBLE to our drive.file token; rclone side must use an
+  app-created folder instead (same pattern as the native side).
+- Phase 4 note: the "our client vs rclone shared client" quota experiment
+  requires an interactive rclone OAuth consent (browser) for rclone's
+  baked-in client — needs user action when we get there, or drop that
+  comparison and sweep client-independent knobs only.
