@@ -130,7 +130,8 @@ func TestManifest(t *testing.T) {
 		func(ci content.Info) error {
 			foundContents++
 			return nil
-		}); err != nil {
+		},
+	); err != nil {
 		t.Errorf("unable to list manifest content: %v", err)
 	}
 
@@ -169,7 +170,7 @@ func TestManifestInitCorruptedBlock(t *testing.T) {
 
 	bm0 := bm
 
-	t.Cleanup(func() { bm0.CloseShared(ctx) })
+	t.Cleanup(func() { bm0.CloseShared(testlogging.ContextForCleanup(t)) })
 
 	mgr, err := NewManager(ctx, bm, ManagerOptions{}, nil)
 	if err != nil {
@@ -195,7 +196,7 @@ func TestManifestInitCorruptedBlock(t *testing.T) {
 	bm, err = content.NewManagerForTesting(ctx, st, fop, nil, nil)
 	require.NoError(t, err)
 
-	t.Cleanup(func() { bm.CloseShared(ctx) })
+	t.Cleanup(func() { bm.CloseShared(testlogging.ContextForCleanup(t)) })
 
 	mgr, err = NewManager(ctx, bm, ManagerOptions{}, nil)
 	if err != nil {
@@ -334,7 +335,7 @@ func newContentManagerForTesting(ctx context.Context, tb testing.TB, data blobte
 	bm, err := content.NewManagerForTesting(ctx, st, fop, nil, nil)
 	require.NoError(tb, err)
 
-	tb.Cleanup(func() { bm.CloseShared(ctx) })
+	tb.Cleanup(func() { bm.CloseShared(testlogging.ContextForCleanup(tb)) })
 
 	return bm
 }
@@ -452,7 +453,8 @@ func getManifestContentCount(ctx context.Context, t *testing.T, mgr *Manager) in
 		func(ci content.Info) error {
 			foundContents++
 			return nil
-		}); err != nil {
+		},
+	); err != nil {
 		t.Errorf("unable to list manifest content: %v", err)
 	}
 

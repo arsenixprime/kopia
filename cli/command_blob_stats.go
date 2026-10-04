@@ -47,18 +47,22 @@ func (c *commandBlobStats) run(ctx context.Context, rep repo.DirectRepository) e
 		blob.ID(c.prefix),
 		func(b blob.Metadata) error {
 			totalSize += b.Length
+
 			count++
 			if count%10000 == 0 {
 				log(ctx).Infof("Got %v blobs...", count)
 			}
+
 			for s := range countMap {
 				if b.Length < s {
 					countMap[s]++
 					totalSizeOfContentsUnder[s] += b.Length
 				}
 			}
+
 			return nil
-		}); err != nil {
+		},
+	); err != nil {
 		return errors.Wrap(err, "error listing blobs")
 	}
 

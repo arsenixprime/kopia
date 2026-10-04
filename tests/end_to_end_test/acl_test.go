@@ -56,7 +56,8 @@ func TestACL(t *testing.T) {
 
 	var sp testutil.ServerParameters
 
-	wait, kill := serverEnvironment.RunAndProcessStderr(t, sp.ProcessOutput,
+	wait, kill := serverEnvironment.RunAndProcessStderr(
+		t, sp.ProcessOutput,
 		"server", "start",
 		"--address=localhost:0",
 		"--server-control-username=admin-user",
@@ -78,7 +79,8 @@ func TestACL(t *testing.T) {
 	delete(foobarClientEnvironment.Environment, "KOPIA_PASSWORD")
 
 	// connect as foo@bar with password baz
-	foobarClientEnvironment.RunAndExpectSuccess(t, "repo", "connect", "server",
+	foobarClientEnvironment.RunAndExpectSuccess(
+		t, "repo", "connect", "server",
 		"--url", sp.BaseURL+"/",
 		"--server-cert-fingerprint", sp.SHA256Fingerprint,
 		"--override-username", "foo",
@@ -94,7 +96,8 @@ func TestACL(t *testing.T) {
 	delete(anotherBarClientEnvironment.Environment, "KOPIA_PASSWORD")
 
 	// connect as foo@bar with password baz
-	anotherBarClientEnvironment.RunAndExpectSuccess(t, "repo", "connect", "server",
+	anotherBarClientEnvironment.RunAndExpectSuccess(
+		t, "repo", "connect", "server",
 		"--url", sp.BaseURL+"/",
 		"--server-cert-fingerprint", sp.SHA256Fingerprint,
 		"--override-username", "another",
@@ -110,7 +113,8 @@ func TestACL(t *testing.T) {
 	delete(aliceInWonderlandClientEnvironment.Environment, "KOPIA_PASSWORD")
 
 	// connect as alice@wonderland with password baz
-	aliceInWonderlandClientEnvironment.RunAndExpectSuccess(t, "repo", "connect", "server",
+	aliceInWonderlandClientEnvironment.RunAndExpectSuccess(
+		t, "repo", "connect", "server",
 		"--url", sp.BaseURL+"/",
 		"--server-cert-fingerprint", sp.SHA256Fingerprint,
 		"--override-username", "alice",
@@ -125,27 +129,23 @@ func TestACL(t *testing.T) {
 	foobarClientEnvironment.RunAndExpectSuccess(t, "snapshot", "create", sharedTestDataDir1)
 
 	// foo@bar sees one snapshot
-	if snaps := clitestutil.ListSnapshotsAndExpectSuccess(t, foobarClientEnvironment, "-a"); len(snaps) != 1 {
-		t.Fatalf("foo@bar expected to see 1 sources (own, got %v", snaps)
-	}
+	snaps := clitestutil.ListSnapshotsAndExpectSuccess(t, foobarClientEnvironment, "-a")
+	require.Len(t, snaps, 1, "foo@bar expected to see 1 source (own)")
 
-	// alice@wonderland sees zero sources
-	if snaps := clitestutil.ListSnapshotsAndExpectSuccess(t, aliceInWonderlandClientEnvironment, "-a"); len(snaps) != 0 {
-		t.Fatalf("foo@bar expected to see 0 sources (own), got %v", snaps)
-	}
+	// alice@wonderland sees zero snapshot sources
+	snaps = clitestutil.ListSnapshotsAndExpectSuccess(t, aliceInWonderlandClientEnvironment, "-a")
+	require.Empty(t, snaps, "alice@wonderland expected to see 0 sources (own)")
 
 	// alice@wonderland takes a snapshot now
 	aliceInWonderlandClientEnvironment.RunAndExpectSuccess(t, "snapshot", "create", sharedTestDataDir1)
 
 	// foo@bar now can see two snapshot sources (own and alice's)
-	if snaps := clitestutil.ListSnapshotsAndExpectSuccess(t, foobarClientEnvironment, "-a"); len(snaps) != 2 {
-		t.Fatalf("foo@bar expected to see 2 sources (own and alice), got %v", snaps)
-	}
+	snaps = clitestutil.ListSnapshotsAndExpectSuccess(t, foobarClientEnvironment, "-a")
+	require.Len(t, snaps, 2, "foo@bar expected to see 2 sources (own and alice's)")
 
 	// alice@wonderland can only see her own
-	if snaps := clitestutil.ListSnapshotsAndExpectSuccess(t, aliceInWonderlandClientEnvironment, "-a"); len(snaps) != 1 {
-		t.Fatalf("foo@bar expected to see 1 source (own), got %v", snaps)
-	}
+	snaps = clitestutil.ListSnapshotsAndExpectSuccess(t, aliceInWonderlandClientEnvironment, "-a")
+	require.Len(t, snaps, 1, "alice@wonderland expected to see 1 source (own)")
 
 	// another@bar can create snapshots but not delete them
 	anotherBarClientEnvironment.RunAndExpectSuccess(t, "snapshot", "create", sharedTestDataDir1)
@@ -168,7 +168,8 @@ func TestACL(t *testing.T) {
 	aliceInWonderlandClientEnvironment.RunAndExpectSuccess(t, "server", "users", "set", "alice@wonderland", "--user-password", "new-password")
 
 	// refresh the auth cache using admin username/password.
-	serverEnvironment.RunAndExpectSuccess(t, "server", "refresh",
+	serverEnvironment.RunAndExpectSuccess(
+		t, "server", "refresh",
 		"--address", sp.BaseURL,
 		"--server-username", "admin-user",
 		"--server-password", "admin-pwd",
@@ -176,7 +177,8 @@ func TestACL(t *testing.T) {
 	)
 
 	// attempt to use foo@bar's credentials when refreshing, this will fail.
-	serverEnvironment.RunAndExpectFailure(t, "server", "refresh",
+	serverEnvironment.RunAndExpectFailure(
+		t, "server", "refresh",
 		"--address", sp.BaseURL,
 		"--server-username", "foo@bar",
 		"--server-password", "baz",
@@ -184,7 +186,8 @@ func TestACL(t *testing.T) {
 	)
 
 	aliceInWonderlandClientEnvironment.RunAndExpectSuccess(t, "repo", "disconnect")
-	aliceInWonderlandClientEnvironment.RunAndExpectSuccess(t, "repo", "connect", "server",
+	aliceInWonderlandClientEnvironment.RunAndExpectSuccess(
+		t, "repo", "connect", "server",
 		"--url", sp.BaseURL+"/",
 		"--server-cert-fingerprint", sp.SHA256Fingerprint,
 		"--override-username", "alice",

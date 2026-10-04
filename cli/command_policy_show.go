@@ -154,10 +154,10 @@ func appendRetentionPolicyRows(rows []policyTableRow, p *policy.Policy, def *pol
 
 func boolToString(v bool) string {
 	if v {
-		return "true"
+		return trueStr
 	}
 
-	return "false"
+	return falseStr
 }
 
 func logDetailToString(v policy.LogDetail) string {
@@ -376,12 +376,14 @@ func appendCompressionPolicyRows(rows []policyTableRow, p *policy.Policy, def *p
 		rows = append(rows, policyTableRow{fmt.Sprintf(
 			"  Only compress files between %v and %v.",
 			units.BytesString(p.CompressionPolicy.MinSize),
-			units.BytesString(p.CompressionPolicy.MaxSize)), "", ""})
+			units.BytesString(p.CompressionPolicy.MaxSize),
+		), "", ""})
 
 	case p.CompressionPolicy.MinSize > 0:
 		rows = append(rows, policyTableRow{fmt.Sprintf(
 			"  Only compress files bigger than %v.",
-			units.BytesString(p.CompressionPolicy.MinSize)), "", ""})
+			units.BytesString(p.CompressionPolicy.MinSize),
+		), "", ""})
 
 	default:
 		rows = append(rows, policyTableRow{"  Compress files of all sizes.", "", ""})

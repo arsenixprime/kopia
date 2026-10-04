@@ -9,7 +9,6 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	azblobblob "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -273,7 +272,7 @@ func (az *azStorage) putBlob(ctx context.Context, b blob.ID, data blob.Bytes, op
 	metadata := make(map[string]*string, len(tsMetadata))
 
 	for k, v := range tsMetadata {
-		metadata[k] = to.Ptr(v)
+		metadata[k] = new(v)
 	}
 
 	uo := &azblockblob.UploadOptions{
@@ -431,7 +430,8 @@ func getAZService(opt *Options, storageHostname string) (*azblob.Client, error) 
 	// shared access signature
 	case opt.SASToken != "":
 		service, serviceErr = azblob.NewClientWithNoCredential(
-			fmt.Sprintf("%s://%s?%s", protocol, storageHostname, opt.SASToken), clientOptions)
+			fmt.Sprintf("%s://%s?%s", protocol, storageHostname, opt.SASToken), clientOptions,
+		)
 	// storage account access key
 	case opt.StorageKey != "":
 		// create a credentials object.
