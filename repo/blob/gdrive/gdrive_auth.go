@@ -706,6 +706,7 @@ func saveAuthorizedUserToken(fn string, cfg *oauth2.Config, token *oauth2.Token)
 		return errors.New("Google did not return a refresh token. This normally means the account had already authorized this OAuth client, revoke Kopia's access at https://myaccount.google.com/permissions and sign in again")
 	}
 
+	//nolint:gosec // G117: persisting the client secret alongside the refresh token is the purpose of this owner-only token cache file.
 	data, err := json.MarshalIndent(authorizedUserJSON{
 		Type:         credentialTypeAuthorizedUser,
 		ClientID:     cfg.ClientID,

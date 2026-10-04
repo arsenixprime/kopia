@@ -208,9 +208,18 @@ type StatSummary struct {
 	Max    float64 `json:"max"`
 }
 
+// Metric names that the charts and checks refer to individually.
+const (
+	metricWallClockMS = "wall_clock_ms"
+	metricQuotaUnits  = "quota_units"
+	metricCPUTotalMS  = "cpu_total_ms"
+	metricOpsPerSec   = "ops_per_sec"
+	metricP50MS       = "p50_ms"
+)
+
 // metricNames are the per-workload metrics the comparison protocol understands,
 // in report order.
-var metricNames = []string{"wall_clock_ms", "p50_ms", "p90_ms", "p99_ms", "ops_per_sec", "errors", "bytes_up", "bytes_down", "quota_units", "paced_wait_ms", "cpu_total_ms"}
+var metricNames = []string{metricWallClockMS, metricP50MS, "p90_ms", "p99_ms", metricOpsPerSec, "errors", "bytes_up", "bytes_down", metricQuotaUnits, "paced_wait_ms", metricCPUTotalMS}
 
 // keyMetricNames are the metrics a baseline check regards as pass/fail signals.
 //
@@ -220,29 +229,29 @@ var metricNames = []string{"wall_clock_ms", "p50_ms", "p90_ms", "p99_ms", "ops_p
 // varies with whatever else the operator is running, and a baseline promoted on
 // a quiet machine would fail every check made on a busy one. Compare flags it,
 // a human reads it, and nothing fails a build over it.
-var keyMetricNames = []string{"wall_clock_ms", "p50_ms"}
+var keyMetricNames = []string{metricWallClockMS, metricP50MS}
 
 // higherIsBetter reports whether a larger value of a metric is an improvement.
 // Everything the harness measures is a cost except throughput.
 func higherIsBetter(metric string) bool {
-	return metric == "ops_per_sec"
+	return metric == metricOpsPerSec
 }
 
 // metricValue extracts a named metric from a workload's metrics. The metrics
 // are passed by pointer only because the struct is large; nothing is mutated.
 func metricValue(m *WorkloadMetrics, metric string) (float64, bool) {
 	switch metric {
-	case "wall_clock_ms":
+	case metricWallClockMS:
 		return m.WallClockMS, true
 	case "p10_ms":
 		return m.Latency.P10, true
-	case "p50_ms":
+	case metricP50MS:
 		return m.Latency.P50, true
 	case "p90_ms":
 		return m.Latency.P90, true
 	case "p99_ms":
 		return m.Latency.P99, true
-	case "ops_per_sec":
+	case metricOpsPerSec:
 		if m.WallClockMS <= 0 {
 			return 0, false
 		}
@@ -254,7 +263,7 @@ func metricValue(m *WorkloadMetrics, metric string) (float64, bool) {
 		return float64(m.BytesUp), true
 	case "bytes_down":
 		return float64(m.BytesDown), true
-	case "quota_units":
+	case metricQuotaUnits:
 		return float64(m.QuotaUnits), true
 	case "paced_wait_ms":
 		return m.PacedWaitMS, true
@@ -276,7 +285,7 @@ func cpuMetricValue(m *WorkloadMetrics, metric string) (float64, bool) {
 		return m.CPUChildrenUserMS, true
 	case "cpu_children_sys_ms":
 		return m.CPUChildrenSysMS, true
-	case "cpu_total_ms":
+	case metricCPUTotalMS:
 		return m.CPUTotalMS, true
 	case "cpu_pct":
 		return m.CPUPct, true

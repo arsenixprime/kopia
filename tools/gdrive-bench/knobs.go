@@ -62,7 +62,7 @@ type knobMeta struct {
 
 // Workload name groups used by the affects table.
 var (
-	writeWorkloads = []string{"small-write", "pack-write"}
+	writeWorkloads = []string{workloadSmallWrite, workloadPackWrite}
 	allNames       = workloadNames()
 )
 
@@ -94,7 +94,7 @@ var knobTable = map[string]knobMeta{
 	},
 	groupTuning + ".uploadChunkSizeMB": {
 		def: "64", hint: "8..256 MB, multiples of 8",
-		affects: []string{"pack-write"},
+		affects: []string{workloadPackWrite},
 		doc:     "Resumable upload chunk size. Also a quota knob: every chunk is a separate edit-class request.",
 	},
 	groupTuning + ".simpleUploadCutoffMB": {
@@ -104,24 +104,24 @@ var knobTable = map[string]knobMeta{
 	},
 	groupTuning + ".listPageSize": {
 		def: "1000", hint: "100..1000 items (1000 is the API maximum)",
-		affects: []string{"list-heavy", "read-metadata"},
+		affects: []string{workloadListHeavy, workloadReadMetadata},
 		doc:     "files.list page size. Each page is a 100-quota-unit call, so smaller pages cost proportionally more quota.",
 	},
 	groupTuning + ".deleteParallelism": {
 		def: "8", hint: "1..32 concurrent deletes",
-		affects: []string{"delete-sweep"},
+		affects: []string{workloadDeleteSweep},
 		doc: "Ceiling on concurrent delete calls held open by one connection. Setting it also raises the delete-sweep workload's own parallelism to " +
 			"the same value (the harness would otherwise clamp it at --parallelism and the knob would measure nothing); the value actually used is " +
 			"recorded in the workload's params.parallelism.",
 	},
 	groupTuning + ".useBatchDelete": {
 		def: "false", hint: "true|false",
-		affects: []string{"delete-sweep"},
+		affects: []string{workloadDeleteSweep},
 		doc:     "Selects the homogeneous batch delete endpoint. Measured at 2.5x SLOWER than parallel singles in Phase 2 (Drive runs batch parts serially); kept for re-measurement, not as a recommendation.",
 	},
 	groupTuning + ".cacheDir": {
 		def: "platform cache directory", hint: "an absolute path",
-		affects: []string{"read-metadata", "delete-sweep"},
+		affects: []string{workloadReadMetadata, workloadDeleteSweep},
 		doc:     "Directory holding the persistent blob-ID to file-ID journal. Moving it onto slower storage shows up in the cold metadata pass.",
 	},
 
@@ -161,22 +161,22 @@ func harnessKnobs() []KnobInfo {
 		mk("trials", "int", "5 (smoke: 1)", "3..15", "Number of trials of the whole suite per target. Fewer than 3 makes the p10/p90 interval meaningless and every comparison unreliable.", allNames),
 		mk("order", "string", "abba", "abba|random|sequential", "Trial interleaving. sequential exists for debugging only: it cannot tell a slow backend from a slow minute.", allNames),
 		mk("cooldown", "duration", "10s (smoke: 0)", "0s..60s", "Pause between consecutive target executions, so one target's backoff state does not spill into the next.", allNames),
-		mk("seed", "int64", "0 (clock)", "any", "Random seed. Recorded in the result; reusing it reproduces the exact blob sizes, offsets and orderings.", []string{"small-write", "range-read"}),
-		mk("pack-size-mb", "int64", "20", "1..1024 MB", "Size of a pack-write blob, and of the pack the range reads come from.", []string{"pack-write", "range-read"}),
-		mk("small-write-n", "int", "100 (smoke: 10)", "10..1000", "Number of small blobs written by small-write.", []string{"small-write"}),
+		mk("seed", "int64", "0 (clock)", "any", "Random seed. Recorded in the result; reusing it reproduces the exact blob sizes, offsets and orderings.", []string{workloadSmallWrite, workloadRangeRead}),
+		mk("pack-size-mb", "int64", "20", "1..1024 MB", "Size of a pack-write blob, and of the pack the range reads come from.", []string{workloadPackWrite, workloadRangeRead}),
+		mk("small-write-n", "int", "100 (smoke: 10)", "10..1000", "Number of small blobs written by small-write.", []string{workloadSmallWrite}),
 		mk("delete-sweep-n", "int", "100 (smoke: 10)", "10..1000",
 			"Blobs delete-sweep writes; it then deletes delete_percent of them. Raise it to make the measured phase long enough for a pacer knob to bind - "+
 				"at the default 100 the phase is ~2 s and draws fewer tokens than the burst pool holds.",
-			[]string{"delete-sweep"}),
+			[]string{workloadDeleteSweep}),
 		mk("parallelism", "int", "8", "1..64",
 			"Bounded parallelism of every workload's cleanup, and of delete-sweep unless the target sets tuning.deleteParallelism, which takes precedence "+
 				"(see that knob). A run that changes it is not comparable to the standing baseline.",
-			[]string{"delete-sweep"}),
+			[]string{workloadDeleteSweep}),
 		mk("daily-upload-fraction", "float64", "0.5", "0.01..1.0", "Fraction of Google's 750 GB/day/user upload cap the harness may spend in one UTC day before it refuses to start.", nil),
 		mk("true-cold", "bool", "false", "true|false",
 			"Delete the on-disk file ID journal between the warm and the cold metadata pass, so read-metadata:cold measures a machine that has "+
 				"never seen the folder. Adds read-metadata:warm and requires every Drive target to set tuning.cacheDir.",
-			[]string{"read-metadata"}),
+			[]string{workloadReadMetadata}),
 		mk("kopia-exe", "string", "built from the work tree", "a path", "The kopia binary snapshot-e2e drives. Leave it unset to measure the code the result's harness.commit names.", []string{snapshotE2EName}),
 		mk("snapshot-files", "int", "800 (smoke: 40)", "50..10000", "Files in the snapshot-e2e source tree. Together with snapshot-mb it decides whether the workload measures per-file overhead or upload throughput.", []string{snapshotE2EName}),
 		mk("snapshot-mb", "int64", "150 (smoke: 6)", "10..2000 MB", "Total size of the snapshot-e2e source tree.", []string{snapshotE2EName}),
@@ -200,8 +200,7 @@ func collectKnobs() []KnobInfo {
 func reflectKnobs(group string, t reflect.Type) []KnobInfo {
 	out := []KnobInfo{}
 
-	for i := range t.NumField() {
-		f := t.Field(i)
+	for f := range t.Fields() {
 		if !f.IsExported() {
 			continue
 		}

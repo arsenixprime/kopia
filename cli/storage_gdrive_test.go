@@ -93,7 +93,7 @@ func TestGDriveTuningFlagsAll(t *testing.T) {
 		SimpleUploadCutoffMB: 60,
 		ListPageSize:         70,
 		DeleteParallelism:    80,
-		UseBatchDelete:       ptrTo(true),
+		UseBatchDelete:       new(true),
 		CacheDir:             "/some/cache/dir",
 	}, c.options.Tuning)
 }
@@ -104,22 +104,18 @@ func TestGDriveUseBatchDeleteIsTriState(t *testing.T) {
 		want *bool
 	}{
 		{nil, nil},
-		{[]string{"--use-batch-delete", "true"}, ptrTo(true)},
-		{[]string{"--use-batch-delete", "false"}, ptrTo(false)},
-		{[]string{"--use-batch-delete=true"}, ptrTo(true)},
-		{[]string{"--use-batch-delete=false"}, ptrTo(false)},
+		{[]string{"--use-batch-delete", "true"}, new(true)},
+		{[]string{"--use-batch-delete", "false"}, new(false)},
+		{[]string{"--use-batch-delete=true"}, new(true)},
+		{[]string{"--use-batch-delete=false"}, new(false)},
 		// last one on the command line wins.
-		{[]string{"--use-batch-delete=true", "--use-batch-delete=false"}, ptrTo(false)},
+		{[]string{"--use-batch-delete=true", "--use-batch-delete=false"}, new(false)},
 	}
 
 	for _, tc := range cases {
 		c := parseGDriveFlags(t, tc.args...)
 		require.Equal(t, tc.want, c.options.Tuning.UseBatchDelete, "args: %v", tc.args)
 	}
-}
-
-func ptrTo[T any](v T) *T {
-	return &v
 }
 
 // TestGDriveCreateFolderNameSetsTheOption: at create time the flag becomes

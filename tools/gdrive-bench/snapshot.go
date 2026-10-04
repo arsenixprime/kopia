@@ -166,7 +166,7 @@ func runSnapshotE2E(ctx context.Context, e *workloadEnv) (phases []phaseMetrics,
 
 	stages, err := k.runStages(ctx,
 		stageSpec{stageCreate, 0, 0, createArgs},
-		stageSpec{stageInit, tree.bytes, 0, []string{"snapshot", "create", source}},
+		stageSpec{stageInit, tree.bytes, 0, snapshotCreateArgs(source)},
 	)
 
 	phases = append(phases, stages...)
@@ -181,7 +181,7 @@ func runSnapshotE2E(ctx context.Context, e *workloadEnv) (phases []phaseMetrics,
 	}
 
 	stages, err = k.runStages(ctx,
-		stageSpec{stageIncremental, changed, 0, []string{"snapshot", "create", source}},
+		stageSpec{stageIncremental, changed, 0, snapshotCreateArgs(source)},
 		stageSpec{stageVerify, 0, tree.bytes, []string{"snapshot", "verify", "--verify-files-percent=100"}},
 		// safety=none is what makes this a maintenance measurement rather than a
 		// no-op: the default full safety refuses to touch blobs younger than its
@@ -426,6 +426,11 @@ func tailOf(s string, n int) string {
 	return "...\n" + s[len(s)-n:]
 }
 
+// snapshotCreateArgs builds the "snapshot create" command line for source.
+func snapshotCreateArgs(source string) []string {
+	return []string{"snapshot", "create", source}
+}
+
 // repositoryCreateArgs builds the "repository create" command line for a
 // target, from the connection the targets file configured. Every provider the
 // harness can benchmark needs an entry here, because the kopia CLI takes flags
@@ -591,7 +596,7 @@ func randomChunk(n int64, rnd *rand.Rand) []byte {
 
 		for j := range int64(bytesPerDraw) {
 			if i+j < n {
-				buf[i+j] = byte(v >> (bitsPerByte * j))
+				buf[i+j] = byte(v >> (bitsPerByte * j)) //nolint:gosec // truncation is intentional: this extracts byte j of v.
 			}
 		}
 	}

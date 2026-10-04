@@ -55,6 +55,17 @@ type benchParams struct {
 	TrueCold bool `json:"true_cold"`
 }
 
+// Workload registry names. Each is also the result key, or the prefix of the
+// result keys of its phases.
+const (
+	workloadSmallWrite   = "small-write"
+	workloadPackWrite    = "pack-write"
+	workloadReadMetadata = "read-metadata"
+	workloadRangeRead    = "range-read"
+	workloadListHeavy    = "list-heavy"
+	workloadDeleteSweep  = "delete-sweep"
+)
+
 // Default workload sizes.
 const (
 	mib int64 = 1 << 20
@@ -194,37 +205,37 @@ type workloadDef struct {
 func allWorkloads() []workloadDef {
 	return []workloadDef{
 		{
-			Name:     "small-write",
+			Name:     workloadSmallWrite,
 			Doc:      "N small index-like blobs, one at a time - per-operation write overhead",
 			Estimate: estimateSmallWrite,
 			Run:      runSmallWrite,
 		},
 		{
-			Name:     "pack-write",
+			Name:     workloadPackWrite,
 			Doc:      "M large pack blobs - upload throughput and the resumable-upload path",
 			Estimate: estimatePackWrite,
 			Run:      runPackWrite,
 		},
 		{
-			Name:     "read-metadata",
+			Name:     workloadReadMetadata,
 			Doc:      "GetMetadata over a written set, with a hot and a cold file-ID cache",
 			Estimate: estimateReadMetadata,
 			Run:      runReadMetadata,
 		},
 		{
-			Name:     "range-read",
+			Name:     workloadRangeRead,
 			Doc:      "R seeded random range reads from pack blobs",
 			Estimate: estimateRangeRead,
 			Run:      runRangeRead,
 		},
 		{
-			Name:     "list-heavy",
+			Name:     workloadListHeavy,
 			Doc:      "repeated whole-storage and prefixed ListBlobs traversals",
 			Estimate: estimateListHeavy,
 			Run:      runListHeavy,
 		},
 		{
-			Name:     "delete-sweep",
+			Name:     workloadDeleteSweep,
 			Doc:      "delete a percentage of a written set with bounded parallelism",
 			Estimate: estimateDeleteSweep,
 			Run:      runDeleteSweep,
@@ -555,7 +566,7 @@ func runSmallWrite(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) 
 
 	m := s.finish(st)
 
-	return one("small-write", &m), s.failure("small-write")
+	return one(workloadSmallWrite, &m), s.failure(workloadSmallWrite)
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +598,7 @@ func runPackWrite(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 
 	m := s.finish(st)
 
-	return one("pack-write", &m), s.failure("pack-write")
+	return one(workloadPackWrite, &m), s.failure(workloadPackWrite)
 }
 
 // ---------------------------------------------------------------------------
@@ -639,7 +650,7 @@ func runReadMetadata(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error
 	out := []phaseMetrics{}
 
 	hot, hotErr := metadataPass(ctx, e.storage(), ids)
-	out = append(out, phaseMetrics{Key: phaseKey("read-metadata", phaseHot), Metrics: hot})
+	out = append(out, phaseMetrics{Key: phaseKey(workloadReadMetadata, phaseHot), Metrics: hot})
 
 	if hotErr != nil {
 		return out, hotErr
@@ -651,7 +662,7 @@ func runReadMetadata(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error
 		}
 
 		warm, warmErr := metadataPass(ctx, e.storage(), ids)
-		out = append(out, phaseMetrics{Key: phaseKey("read-metadata", phaseWarm), Metrics: warm})
+		out = append(out, phaseMetrics{Key: phaseKey(workloadReadMetadata, phaseWarm), Metrics: warm})
 
 		if warmErr != nil {
 			return out, warmErr
@@ -665,7 +676,7 @@ func runReadMetadata(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error
 	}
 
 	cold, coldErr := metadataPass(ctx, e.storage(), ids)
-	out = append(out, phaseMetrics{Key: phaseKey("read-metadata", phaseCold), Metrics: cold})
+	out = append(out, phaseMetrics{Key: phaseKey(workloadReadMetadata, phaseCold), Metrics: cold})
 
 	return out, coldErr
 }
@@ -681,7 +692,7 @@ func metadataPass(ctx context.Context, st blob.Storage, ids []blob.ID) (Workload
 		s.observe(t.Elapsed(), err)
 	}
 
-	return s.finish(st), s.failure("read-metadata")
+	return s.finish(st), s.failure(workloadReadMetadata)
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +751,7 @@ func runRangeRead(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 
 	m := s.finish(st)
 
-	return one("range-read", &m), s.failure("range-read")
+	return one(workloadRangeRead, &m), s.failure(workloadRangeRead)
 }
 
 // ---------------------------------------------------------------------------
@@ -773,14 +784,14 @@ func runListHeavy(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error) {
 	// the folder too.
 	full, fullErr := listPass(ctx, st, "", e.params.ListTraversals)
 	if fullErr != nil {
-		return one(phaseKey("list-heavy", "full"), &full), fullErr
+		return one(phaseKey(workloadListHeavy, "full"), &full), fullErr
 	}
 
 	prefixed, prefixedErr := listPass(ctx, st, e.prefix+"lh-", e.params.ListTraversals)
 
 	return []phaseMetrics{
-		{Key: phaseKey("list-heavy", "full"), Metrics: full},
-		{Key: phaseKey("list-heavy", "prefixed"), Metrics: prefixed},
+		{Key: phaseKey(workloadListHeavy, "full"), Metrics: full},
+		{Key: phaseKey(workloadListHeavy, "prefixed"), Metrics: prefixed},
 	}, prefixedErr
 }
 
@@ -795,7 +806,7 @@ func listPass(ctx context.Context, st blob.Storage, prefix blob.ID, count int) (
 		s.observe(t.Elapsed(), err)
 	}
 
-	return s.finish(st), s.failure("list-heavy")
+	return s.finish(st), s.failure(workloadListHeavy)
 }
 
 // ---------------------------------------------------------------------------
@@ -832,7 +843,7 @@ func runDeleteSweep(ctx context.Context, e *workloadEnv) ([]phaseMetrics, error)
 	m := s.finish(st)
 	m.Params = map[string]int64{deleteSweepParallelismParam: int64(parallelism)}
 
-	return one("delete-sweep", &m), s.failure("delete-sweep")
+	return one(workloadDeleteSweep, &m), s.failure(workloadDeleteSweep)
 }
 
 // deleteSweepParallelismParam is the key delete-sweep records its effective

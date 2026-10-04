@@ -597,7 +597,7 @@ func (c *persistentIDCache) loadLocked() error {
 //
 // +checklocks:c.writeMu
 func (c *persistentIDCache) noteScannedLocked(end int64) {
-	st, err := os.Stat(c.journalPath)
+	st, err := os.Stat(c.journalPath) //nolint:gosec // G703: journalPath is derived from the cache directory and a config hash, not request input.
 	if err != nil {
 		c.scanInfo, c.scanOffset = nil, 0
 
@@ -677,7 +677,7 @@ func (c *persistentIDCache) reopenLocked() error {
 func (c *persistentIDCache) ensureOpenLocked() error {
 	if c.f != nil {
 		fi1, err1 := c.f.Stat()
-		fi2, err2 := os.Stat(c.journalPath)
+		fi2, err2 := os.Stat(c.journalPath) //nolint:gosec // G703: journalPath is derived from the cache directory and a config hash, not request input.
 
 		if err1 == nil && err2 == nil && os.SameFile(fi1, fi2) {
 			return nil
@@ -687,7 +687,7 @@ func (c *persistentIDCache) ensureOpenLocked() error {
 		c.f = nil
 	}
 
-	f, err := os.OpenFile(c.journalPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, cacheFileMode)
+	f, err := os.OpenFile(c.journalPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, cacheFileMode) //nolint:gosec // G703: journalPath is derived from the cache directory and a config hash, not request input.
 	if err != nil {
 		return errors.Wrap(err, "unable to open file ID journal")
 	}
@@ -797,7 +797,7 @@ func (c *persistentIDCache) readJournalFrom(start int64) (journalScan, error) {
 		end:     start,
 	}
 
-	f, err := os.Open(c.journalPath)
+	f, err := os.Open(c.journalPath) //nolint:gosec // G703: journalPath is derived from the cache directory and a config hash, not request input.
 	if err != nil {
 		if os.IsNotExist(err) {
 			return journalScan{entries: res.entries}, nil
@@ -982,7 +982,7 @@ func (c *persistentIDCache) compactLocked() error {
 
 	defer func() {
 		tmp.Close()        //nolint:errcheck
-		os.Remove(tmpName) //nolint:errcheck
+		os.Remove(tmpName) //nolint:errcheck,gosec // G703: tmpName comes from os.CreateTemp in the cache directory.
 	}()
 
 	if err := tmp.Chmod(cacheFileMode); err != nil {
@@ -1022,7 +1022,7 @@ func (c *persistentIDCache) compactLocked() error {
 		return errors.Wrap(err, "unable to close compacted file ID journal")
 	}
 
-	if err := os.Rename(tmpName, c.journalPath); err != nil {
+	if err := os.Rename(tmpName, c.journalPath); err != nil { //nolint:gosec // G703: journalPath is derived from the cache directory and a config hash, not request input.
 		return errors.Wrap(err, "unable to replace file ID journal")
 	}
 
@@ -1036,7 +1036,7 @@ func (c *persistentIDCache) compactLocked() error {
 
 	// The compacted file holds exactly what this process has in memory, so the
 	// next tail read must start at its end.
-	if st, serr := os.Stat(c.journalPath); serr == nil {
+	if st, serr := os.Stat(c.journalPath); serr == nil { //nolint:gosec // G703: journalPath is derived from the cache directory and a config hash, not request input.
 		c.scanInfo, c.scanOffset = st, st.Size()
 	} else {
 		c.scanInfo, c.scanOffset = nil, 0
@@ -1060,7 +1060,6 @@ func encodeRecord(blobID blob.ID, fileID string) ([]byte, bool) {
 	rec := make([]byte, recordHeaderLen, recordHeaderLen+payloadLen)
 
 	copy(rec, recordMagic[:])
-	//nolint:gosec // bounds-checked immediately above.
 	binary.LittleEndian.PutUint32(rec[recordMagicLen:], uint32(payloadLen))
 
 	//nolint:gosec // bounds-checked immediately above.

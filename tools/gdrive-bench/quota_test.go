@@ -127,7 +127,8 @@ func TestRunRefusesWhenLedgerIsExhausted(t *testing.T) {
 	// A gdrive target is never connected to: the quota guard runs first and
 	// refuses, which is the whole point of the guard.
 	require.NoError(t, writeFileAtomic(targetsPath, []byte(
-		`[{"name":"native","connection":{"type":"gdrive","config":{"folderID":"none","tuning":{}}}}]`)))
+		`[{"name":"native","connection":{"type":"gdrive","config":{"folderID":"none","tuning":{}}}}]`,
+	)))
 
 	results := filepath.Join(dir, "results")
 	require.NoError(t, os.MkdirAll(results, dirPermissions))

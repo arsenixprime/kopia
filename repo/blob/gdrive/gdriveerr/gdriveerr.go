@@ -325,8 +325,14 @@ type rule struct {
 	dailyCap bool
 }
 
+// reasonAuthError is the Drive reason used for credential failures, including
+// token-minting errors that carry no reason of their own.
+const reasonAuthError = "authError"
+
 // Remediation text shared by several reasons.
 const (
+	transientServerHelp = "transient server-side failure; retrying with exponential backoff."
+
 	driveFileScopeHelp = "under the drive.file scope an app can only see files that it created itself or that the " +
 		"user explicitly opened with it, so a folder or blob created by another app, another user or through the " +
 		"Drive web UI is invisible to this app even though the account can see it; fix by reconnecting with a " +
@@ -366,7 +372,7 @@ var reasonRules = normalizeRules(map[string]rule{
 	},
 
 	// ---------------- 401 Unauthorized ----------------
-	"authError": {
+	reasonAuthError: {
 		disposition: FatalAuth,
 		summary:     "invalid Drive credentials",
 		remediation: "the access token is expired or invalid, or it is missing the scopes this operation needs. " +
@@ -582,17 +588,17 @@ var reasonRules = normalizeRules(map[string]rule{
 	"backendError": {
 		disposition: RetryableResume,
 		summary:     "Google Drive returned a backend error",
-		remediation: "transient server-side failure; retrying with exponential backoff.",
+		remediation: transientServerHelp,
 	},
 	"internalError": {
 		disposition: RetryableResume,
 		summary:     "Google Drive returned an internal error",
-		remediation: "transient server-side failure; retrying with exponential backoff.",
+		remediation: transientServerHelp,
 	},
 	"internalServerError": {
 		disposition: RetryableResume,
 		summary:     "Google Drive returned an internal server error",
-		remediation: "transient server-side failure; retrying with exponential backoff.",
+		remediation: transientServerHelp,
 	},
 })
 
@@ -604,8 +610,8 @@ var errorInfoAliases = map[string]string{
 	"SERVICE_DISABLED":                "accessNotConfigured",
 	"RATE_LIMIT_EXCEEDED":             "rateLimitExceeded",
 	"RESOURCE_EXHAUSTED":              "quotaExceeded",
-	"ACCESS_TOKEN_EXPIRED":            "authError",
-	"ACCESS_TOKEN_SCOPE_INSUFFICIENT": "authError",
+	"ACCESS_TOKEN_EXPIRED":            reasonAuthError,
+	"ACCESS_TOKEN_SCOPE_INSUFFICIENT": reasonAuthError,
 }
 
 // normalizeRules rewrites the table's keys into their normalized form and
@@ -746,7 +752,7 @@ func fromOAuthError(orig error, re *oauth2.RetrieveError, op, blobID string) err
 
 	reason := re.ErrorCode
 	if reason == "" {
-		reason = "authError"
+		reason = reasonAuthError
 	}
 
 	r := lookup(code, reason)
@@ -754,7 +760,7 @@ func fromOAuthError(orig error, re *oauth2.RetrieveError, op, blobID string) err
 		// Any failure to mint a token is a credential problem, whatever the
 		// transport said, unless it is a plain rate limit or server error.
 		if code == 0 || (code >= http.StatusBadRequest && code < http.StatusInternalServerError && code != http.StatusTooManyRequests) {
-			r = reasonRules[normalizeReason("authError")]
+			r = reasonRules[normalizeReason(reasonAuthError)]
 		}
 	}
 
@@ -833,7 +839,7 @@ func lookup(code int, reason string) rule {
 func defaultRuleForStatus(c int, rs string) rule {
 	switch {
 	case c == http.StatusUnauthorized:
-		r := reasonRules[normalizeReason("authError")]
+		r := reasonRules[normalizeReason(reasonAuthError)]
 		r.summary = withReason(r.summary, rs)
 
 		return r
@@ -1046,7 +1052,7 @@ func RetryDelay(err error, attempt int) time.Duration {
 
 	shift := min(attempt, maxBackoffShift)
 
-	window := min(BackoffBase<<uint(shift), BackoffCap) //nolint:gosec
+	window := min(BackoffBase<<uint(shift), BackoffCap)
 
 	// Full jitter: uniform in [0, window).
 	d := time.Duration(rand.Int64N(int64(window))) //nolint:gosec

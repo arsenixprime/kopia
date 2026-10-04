@@ -800,7 +800,7 @@ func (s *gdriveStorage) GetCapacity(ctx context.Context) (blob.Capacity, error) 
 
 	return blob.Capacity{
 		SizeB: uint64(q.Limit), //nolint:gosec // Limit > 0 was checked above.
-		FreeB: uint64(free),    //nolint:gosec // clamped to >= 0 above.
+		FreeB: uint64(free),
 	}, nil
 }
 

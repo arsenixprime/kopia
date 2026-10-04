@@ -292,7 +292,8 @@ func TestKnobNamesMatchTheConnectionConfigKeys(t *testing.T) {
 	// A knob name must be directly usable in a targets file, so the tuning
 	// knobs' field names have to be the JSON keys of gdrive.TuningOptions.
 	targets, err := parseTargets([]byte(
-		`[{"name":"n","connection":{"type":"gdrive","config":{"folderID":"f","tuning":{"pacerMinSleepMS":50,"useBatchDelete":true}}}}]`), lookupMap(nil))
+		`[{"name":"n","connection":{"type":"gdrive","config":{"folderID":"f","tuning":{"pacerMinSleepMS":50,"useBatchDelete":true}}}}]`,
+	), lookupMap(nil))
 	require.NoError(t, err)
 
 	for key := range targets[0].Knobs {

@@ -53,7 +53,7 @@ func resolveResultsDir(ctx context.Context, override string) (string, error) {
 		return "", errors.Errorf("the results directory %v is inside the repository at %v; point %v somewhere else (results are never stored in the tree)", abs, root, resultsDirEnvVar)
 	}
 
-	if err := os.MkdirAll(abs, dirPermissions); err != nil {
+	if err := os.MkdirAll(abs, dirPermissions); err != nil { //nolint:gosec // G703: the results directory is chosen by the operator running the tool.
 		return "", errors.Wrapf(err, "unable to create the results directory %v", abs)
 	}
 
@@ -103,7 +103,7 @@ func repoRoot(ctx context.Context) (string, bool) {
 // runGit runs a read-only git command in the current directory and returns its
 // trimmed stdout.
 func runGit(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: args are fixed read-only git subcommands supplied by this package.
 
 	out, err := cmd.Output()
 	if err != nil {

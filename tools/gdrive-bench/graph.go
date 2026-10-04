@@ -173,9 +173,9 @@ func (d *graphData) keysWithMetric(metric string) []string {
 // Alphabetical would put "cold" before "hot" and "create" after "verify", which
 // is the opposite of the order they happen in.
 var phaseOrder = map[string][]string{
-	"read-metadata": {phaseHot, phaseWarm, phaseCold},
-	"list-heavy":    {"full", "prefixed"},
-	snapshotE2EName: {stageCreate, stageInit, stageIncremental, stageVerify, stageMaintenance},
+	workloadReadMetadata: {phaseHot, phaseWarm, phaseCold},
+	workloadListHeavy:    {"full", "prefixed"},
+	snapshotE2EName:      {stageCreate, stageInit, stageIncremental, stageVerify, stageMaintenance},
 }
 
 // sortWorkloadKeys orders result keys by the registry order of their workload
@@ -346,7 +346,7 @@ func graphDataFromCompare(path string, rep *CompareReport) (*graphData, error) {
 }
 
 // chartMetrics are the metrics the charts read out of a run document.
-var chartMetrics = []string{"wall_clock_ms", "cpu_total_ms", "quota_units"}
+var chartMetrics = []string{metricWallClockMS, metricCPUTotalMS, metricQuotaUnits}
 
 // ---------------------------------------------------------------------------
 // the charts
@@ -369,12 +369,12 @@ func isStageKey(k string) bool {
 // not (a bar twice as long would not be twice the time). The panels are labeled
 // with their own range and the chart says they do not share a scale.
 func chartWallClock(d *graphData, split bool) *barChart {
-	keys := d.keysWithMetric("wall_clock_ms")
+	keys := d.keysWithMetric(metricWallClockMS)
 	if len(keys) == 0 {
 		return nil
 	}
 
-	rows := d.rowsFor(keys, "wall_clock_ms", formatMS, nil)
+	rows := d.rowsFor(keys, metricWallClockMS, formatMS, nil)
 	if len(rows) == 0 {
 		return nil
 	}
@@ -406,7 +406,7 @@ func chartWallClock(d *graphData, split bool) *barChart {
 func chartStages(d *graphData) *barChart {
 	keys := []string{}
 
-	for _, k := range d.keysWithMetric("wall_clock_ms") {
+	for _, k := range d.keysWithMetric(metricWallClockMS) {
 		if isStageKey(k) {
 			keys = append(keys, k)
 		}
@@ -416,7 +416,7 @@ func chartStages(d *graphData) *barChart {
 		return nil
 	}
 
-	rows := d.rowsFor(keys, "wall_clock_ms", formatMS, nil)
+	rows := d.rowsFor(keys, metricWallClockMS, formatMS, nil)
 	if len(rows) == 0 {
 		return nil
 	}
@@ -440,7 +440,7 @@ func chartStages(d *graphData) *barChart {
 
 // chartCPU is the CPU cost of each workload to the whole machine.
 func chartCPU(d *graphData) *barChart {
-	keys := d.keysWithMetric("cpu_total_ms")
+	keys := d.keysWithMetric(metricCPUTotalMS)
 	if len(keys) == 0 {
 		return nil
 	}
@@ -449,13 +449,13 @@ func chartCPU(d *graphData) *barChart {
 	// almost no CPU has leaked its accounting, and the flattering number must be
 	// published as a hole rather than as a measurement.
 	broken := func(wk, series string) bool {
-		wall, wok := d.get(wk, "wall_clock_ms", series)
-		cpu, cok := d.get(wk, "cpu_total_ms", series)
+		wall, wok := d.get(wk, metricWallClockMS, series)
+		cpu, cok := d.get(wk, metricCPUTotalMS, series)
 
 		return wok && cok && suspectCPUAccounting(wall.stat.Median, cpu.stat.Median)
 	}
 
-	rows := d.rowsFor(keys, "cpu_total_ms", formatMS, broken)
+	rows := d.rowsFor(keys, metricCPUTotalMS, formatMS, broken)
 	if len(rows) == 0 || allZero(rows) {
 		// A document written before CPU accounting existed carries the field with
 		// its zero value everywhere. Drawing a chart of zeros would claim a
@@ -489,7 +489,7 @@ func chartQuota(d *graphData) *barChart {
 	ref := d.series[0]
 	keys := []string{}
 
-	for _, k := range d.keysWithMetric("quota_units") {
+	for _, k := range d.keysWithMetric(metricQuotaUnits) {
 		// snapshot-e2e's quota is ESTIMATED from bytes moved (§5), not counted:
 		// its rows would be identical on both lanes by construction and would
 		// silently mix a measurement with an assumption. Only the in-process
@@ -498,7 +498,7 @@ func chartQuota(d *graphData) *barChart {
 			continue
 		}
 
-		if c, ok := d.get(k, "quota_units", ref); ok && c.stat.Median > 0 {
+		if c, ok := d.get(k, metricQuotaUnits, ref); ok && c.stat.Median > 0 {
 			keys = append(keys, k)
 		}
 	}
@@ -508,7 +508,7 @@ func chartQuota(d *graphData) *barChart {
 	}
 
 	single := &graphData{series: []string{ref}, trials: d.trials, cells: d.cells}
-	rows := single.rowsFor(keys, "quota_units", formatCount, nil)
+	rows := single.rowsFor(keys, metricQuotaUnits, formatCount, nil)
 
 	unobserved := "the other lane"
 	if len(d.series) > 1 {
