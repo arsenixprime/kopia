@@ -151,6 +151,24 @@ reviews RECON.md against the gate checklist.
 - LOCAL_TESTING.md rewritten rclone-free (per-machine repo layout
   recommended for client machines; cross-user drive.file sharing
   explicitly steered away from pending live testing).
+- **Upstream sync 2026-10-03** (user-requested check): merged
+  upstream/master b1da5999 into gdrive-native-v2 (91 commits since fork
+  point 133fc64c, ZERO file overlap with our changes — conflict-free).
+  Gains: google.golang.org/api v0.290→v0.299, oauth2 v0.37, Go 1.26,
+  golangci-lint 2.14.0. New linter flagged ~40 findings in our code
+  (uncapped count; none real bugs): gosec G703 path-taint false
+  positives on cache-journal paths (suppressed with reasons, matching
+  upstream's own nolint idiom — gosec 2.29 does not accept
+  filepath.Clean as sanitizer), G117 on token-cache marshal, 3 nolint
+  directives newly unused, goconst, modernize new(expr) (Go 1.26),
+  gofumpt. Opus agent fixed all; zero behavior change; lint exits 0
+  uncapped; full build + gdrive/bench/cli tests green on new deps.
+  Commits: add5137d (merge), 6c47b990 (lint fixes).
+  Upstream branch REBUILT: gdrive-native-upstream @ 8c1220d5, single
+  commit (reused 03290d1e message) directly on upstream/master
+  b1da5999; byte-identical to work branch for upstream paths (diff=0);
+  build/test/lint verified on the branch itself. User's trial binaries
+  (4b2ad623+) need no rebuild — no behavior change in this sync.
 
 ## PROJECT COMPLETE 2026-08-02
 
