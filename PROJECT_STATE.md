@@ -169,6 +169,17 @@ reviews RECON.md against the gate checklist.
   b1da5999; byte-identical to work branch for upstream paths (diff=0);
   build/test/lint verified on the branch itself. User's trial binaries
   (4b2ad623+) need no rebuild — no behavior change in this sync.
+- **Public installer repo 2026-10-04** —
+  github.com/arsenixprime/kopia-gdrive-setup: standalone installer
+  (script + README + CLAUDE.md only; binaries from build 96cb022d as
+  v0.1.0 release assets with SHA256SUMS; client.json/tokens
+  gitignored, live token never committed). Setup script extended with
+  BYO-OAuth mode (client.json → loopback consent, DEVICE_FLOW=1 for
+  headless) alongside existing-token mode; README documents the GCP
+  OAuth walkthrough incl. the publish-to-production requirement
+  (Testing-mode refresh tokens die after 7 days). Branch
+  gdrive-native-upstream pushed to the public fork so users can build
+  from source. ~/kopia-gdrive-setup is now that repo's working clone.
 - **Trial deployment: miniman 2026-10-04** — full-host daily backup,
   build 96cb022d (first machine on post-sync deps, Drive client
   v0.299). Ubuntu 26.04 x86_64, root-run systemd units: daily 03:00+30m
