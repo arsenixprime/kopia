@@ -169,6 +169,15 @@ reviews RECON.md against the gate checklist.
   b1da5999; byte-identical to work branch for upstream paths (diff=0);
   build/test/lint verified on the branch itself. User's trial binaries
   (4b2ad623+) need no rebuild — no behavior change in this sync.
+- **Trial deployment: miniman 2026-10-04** — full-host daily backup,
+  build 96cb022d (first machine on post-sync deps, Drive client
+  v0.299). Ubuntu 26.04 x86_64, root-run systemd units: daily 03:00+30m
+  snapshot of / (excludes tmp/logs/caches/pseudo-fs), weekly Sunday
+  10% snapshot verify. Repo: app-owned folder kopia-backup-miniman,
+  config/token/password root-only in /etc/kopia-gdrive/. First seed:
+  9.4G source in 7m15s, 0 errors, auto full maintenance OK, 2m29s CPU
+  / 5.9G mem peak. Setup bundle kept at ~/miniman-setup/ (dev box) for
+  reuse on further client machines.
 
 ## PROJECT COMPLETE 2026-08-02
 
