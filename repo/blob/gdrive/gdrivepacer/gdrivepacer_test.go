@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -659,16 +660,56 @@ func TestContextCanceledBeforeCallSkipsFn(t *testing.T) {
 func TestContextErrorFromFnPassesThroughUnchanged(t *testing.T) {
 	p, _ := newTestPacer(t, Config{Burst: 1000}, nil)
 
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var attempts int
+
+	err := p.Call(ctx, "GetBlob", "b1", func() error {
+		attempts++
+
+		// The caller gives up while the request is in flight.
+		cancel()
+
+		return context.Canceled
+	})
+
+	require.Equal(t, context.Canceled, err)
+	require.Equal(t, 1, attempts, "a canceled request is the caller's decision, never a retry")
+}
+
+// TestTransportTimeoutWithLiveContextIsRetried: net/http reports its own
+// ResponseHeaderTimeout (and a dial timeout) as errors matching
+// context.DeadlineExceeded. With the caller's context still live such an error
+// is a stalled connection, not a cancellation, and must be retried.
+func TestTransportTimeoutWithLiveContextIsRetried(t *testing.T) {
+	p, _ := newTestPacer(t, Config{Burst: 1000}, nil)
+
 	var attempts int
 
 	err := p.Call(t.Context(), "GetBlob", "b1", func() error {
 		attempts++
+		if attempts < 3 {
+			return &url.Error{Op: "Get", URL: "https://www.googleapis.com/drive/v3/files/x", Err: context.DeadlineExceeded}
+		}
 
-		return context.DeadlineExceeded
+		return nil
 	})
 
-	require.Equal(t, context.DeadlineExceeded, err)
-	require.Equal(t, 1, attempts, "a canceled request is the caller's decision, never a retry")
+	require.NoError(t, err)
+	require.Equal(t, 3, attempts)
+}
+
+func TestTransportTimeoutRetriesExhaustedIsNotACancellation(t *testing.T) {
+	p, _ := newTestPacer(t, Config{Burst: 1000, MaxTries: 2}, nil)
+
+	err := p.Call(t.Context(), "GetBlob", "b1", func() error {
+		return &url.Error{Op: "Get", URL: "https://www.googleapis.com/drive/v3/files/x", Err: context.DeadlineExceeded}
+	})
+
+	de, ok := gdriveerr.AsDriveError(err)
+	require.True(t, ok)
+	require.Equal(t, gdriveerr.RetryableResume, de.Disposition())
+	require.NotErrorIs(t, err, context.DeadlineExceeded, "upper layers must not mistake a stall for the caller's cancellation")
 }
 
 func TestUnclassifiedErrorIsRetriedThenReturnedClassified(t *testing.T) {

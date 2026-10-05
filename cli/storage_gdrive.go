@@ -103,6 +103,10 @@ func (c *storageGDriveFlags) gdriveTuningFlags(cmd *kingpin.CmdClause) {
 	cmd.Flag("delete-parallelism", "Maximum number of concurrent delete calls (advanced tuning).").IntVar(&t.DeleteParallelism)
 	cmd.Flag("use-batch-delete", "Delete blobs through the batch endpoint instead of one call each, 'true' or 'false' (advanced tuning).").PlaceHolder("BOOL").BoolListVar(&c.useBatchDelete)
 	cmd.Flag("tuning-cache-dir", "Directory holding the Google Drive backend's file ID cache (advanced tuning).").PlaceHolder("PATH").StringVar(&t.CacheDir)
+	cmd.Flag("http2-read-idle-timeout-sec", "Seconds an HTTP/2 connection may receive nothing before it is health-checked with a ping (advanced tuning).").IntVar(&t.HTTP2ReadIdleTimeoutSec)
+	cmd.Flag("http2-ping-timeout-sec", "Seconds to wait for a health-check ping reply before an HTTP/2 connection is declared dead (advanced tuning).").IntVar(&t.HTTP2PingTimeoutSec)
+	cmd.Flag("response-header-timeout-sec", "Seconds to wait for response headers once a request has been fully sent (advanced tuning).").IntVar(&t.ResponseHeaderTimeoutSec)
+	cmd.Flag("io-idle-timeout-sec", "Seconds a connection may go without reading or writing anything before it is closed as stalled (advanced tuning).").IntVar(&t.IOIdleTimeoutSec)
 }
 
 // applyOptionalTuningFlags folds the tuning flags that cannot be bound directly to

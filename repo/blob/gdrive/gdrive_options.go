@@ -114,4 +114,20 @@ type TuningOptions struct {
 
 	// CacheDir overrides the directory holding the backend's local caches.
 	CacheDir string `json:"cacheDir,omitempty"`
+
+	// HTTP2ReadIdleTimeoutSec is how long an HTTP/2 connection may receive
+	// nothing before a health-check ping is sent on it, in seconds.
+	HTTP2ReadIdleTimeoutSec int `json:"http2ReadIdleTimeoutSec,omitempty"`
+
+	// HTTP2PingTimeoutSec is how long an unanswered health-check ping waits
+	// before the HTTP/2 connection is declared dead, in seconds.
+	HTTP2PingTimeoutSec int `json:"http2PingTimeoutSec,omitempty"`
+
+	// ResponseHeaderTimeoutSec bounds the wait for response headers after the
+	// request, including its body, has been sent, in seconds.
+	ResponseHeaderTimeoutSec int `json:"responseHeaderTimeoutSec,omitempty"`
+
+	// IOIdleTimeoutSec is how long a connection may go without reading or
+	// writing a single byte before it is closed as stalled, in seconds.
+	IOIdleTimeoutSec int `json:"ioIdleTimeoutSec,omitempty"`
 }

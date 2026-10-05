@@ -37,7 +37,9 @@
 //     FatalInvalidRange, NonRetryableOther: return immediately, after one
 //     attempt.
 //   - context.Canceled and context.DeadlineExceeded are returned unchanged and
-//     never retried.
+//     never retried - when the caller's ctx is done. With ctx still live they
+//     came from inside the HTTP stack (a stall timeout) and are retried as
+//     RetryableResume; see gdriveerr.ClassifyContext.
 //
 // Call always returns the classified error, so callers get gdriveerr's
 // sentinel unwrapping (blob.ErrBlobNotFound, blob.ErrBlobAlreadyExists,
@@ -58,7 +60,6 @@ package gdrivepacer
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
@@ -281,14 +282,16 @@ func (p *Pacer) call(ctx context.Context, op, blobID string, fn func() error, ma
 			return err
 		}
 
-		err := gdriveerr.Classify(fn(), op, blobID)
+		err := gdriveerr.ClassifyContext(ctx, fn(), op, blobID)
 		if err == nil {
 			p.succeeded()
 
 			return nil
 		}
 
-		if isContextError(err) {
+		// ClassifyContext leaves an error unclassified only when it is the
+		// caller's own cancellation.
+		if _, classified := gdriveerr.AsDriveError(err); !classified {
 			return err //nolint:wrapcheck // context errors are propagated verbatim by contract
 		}
 
@@ -449,10 +452,6 @@ func (p *Pacer) mildBackoff(ctx context.Context, op string, err error, attempt i
 	p.rec.RecordBackoff(op, d)
 
 	return p.clk.Sleep(ctx, d) //nolint:wrapcheck // Sleep only ever returns ctx.Err(), propagated verbatim
-}
-
-func isContextError(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func reasonOf(err error) string {

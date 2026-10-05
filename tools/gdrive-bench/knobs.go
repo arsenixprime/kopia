@@ -124,6 +124,24 @@ var knobTable = map[string]knobMeta{
 		affects: []string{workloadReadMetadata, workloadDeleteSweep},
 		doc:     "Directory holding the persistent blob-ID to file-ID journal. Moving it onto slower storage shows up in the cold metadata pass.",
 	},
+	groupTuning + ".http2ReadIdleTimeoutSec": {
+		def: "31", hint: "10..120 s",
+		doc: "Silence on an HTTP/2 connection after which it is health-checked with a ping. Stall detection only: it moves no number on a " +
+			"healthy run, only how fast a dead connection (suspend/resume, network change) is abandoned.",
+	},
+	groupTuning + ".http2PingTimeoutSec": {
+		def: "15", hint: "5..60 s",
+		doc: "How long an unanswered health-check ping waits before the HTTP/2 connection is declared dead. Stall detection only.",
+	},
+	groupTuning + ".responseHeaderTimeoutSec": {
+		def: "120", hint: "30..600 s",
+		doc: "Wait for response headers after a request is fully sent (upload time is not included). Too low fails slow resumable-chunk " +
+			"finalization and shows up as upload retries; otherwise stall detection only.",
+	},
+	groupTuning + ".ioIdleTimeoutSec": {
+		def: "300", hint: "60..900 s",
+		doc: "A connection with no bytes read or written for this long is closed as stalled (rclone's --timeout). Stall detection only.",
+	},
 
 	groupPacer + ".minSleep": {
 		def: gdrivepacer.DefaultMinSleep.String(), hint: "25ms..500ms",

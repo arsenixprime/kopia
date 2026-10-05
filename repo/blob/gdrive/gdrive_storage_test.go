@@ -1213,6 +1213,8 @@ func TestGdriveStorageLive(t *testing.T) {
 		deleteLiveTestFolder(ctx, t, testOpt)
 	}()
 
+	requireHTTP2ToDrive(ctx, t, mustGdriveStorage(t, st))
+
 	blobtesting.VerifyStorage(ctx, t, st, blob.PutOptions{})
 	blobtesting.AssertConnectionInfoRoundTrips(ctx, t, st)
 
@@ -1484,6 +1486,23 @@ func TestGdriveStorageLiveInvalidFolder(t *testing.T) {
 
 	_, err := New(ctx, opt, false)
 	require.Error(t, err, "unexpected success connecting to a non-existent Drive folder")
+}
+
+// requireHTTP2ToDrive checks that the production transport still negotiates
+// HTTP/2 with Google - the health-check pings only exist on HTTP/2.
+func requireHTTP2ToDrive(ctx context.Context, t *testing.T, s *gdriveStorage) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.service.BasePath+"about?fields=user(kind)", http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := s.httpClient.Do(req)
+	require.NoError(t, err)
+
+	defer resp.Body.Close() //nolint:errcheck
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, 2, resp.ProtoMajor, "Drive must be reached over HTTP/2, got %v", resp.Proto)
 }
 
 func mustGetLiveOptionsOrSkip(t *testing.T) *Options {

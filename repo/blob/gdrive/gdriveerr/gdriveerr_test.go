@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"syscall"
 	"testing"
@@ -710,4 +711,129 @@ func TestDispositionOfUnclassified(t *testing.T) {
 func TestNoReasonIsNeverEmptyMessage(t *testing.T) {
 	out := Classify(gerr(451, "", ""), testOp, testBlobID)
 	require.NotEmpty(t, strings.TrimSpace(out.Error()))
+}
+
+// fakeHTTPTimeoutError mimics net/http's unexported timeoutError (returned for
+// ResponseHeaderTimeout), which is a net.Error that ALSO claims to be
+// context.DeadlineExceeded.
+type fakeHTTPTimeoutError struct{}
+
+func (fakeHTTPTimeoutError) Error() string   { return "net/http: timeout awaiting response headers" }
+func (fakeHTTPTimeoutError) Timeout() bool   { return true }
+func (fakeHTTPTimeoutError) Temporary() bool { return true }
+
+func (fakeHTTPTimeoutError) Is(target error) bool { return target == context.DeadlineExceeded } //nolint:errorlint
+
+func TestStallErrorsAreRetryableResume(t *testing.T) {
+	cases := map[string]error{
+		"io-idle-deadline":         &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded},
+		"io-idle-deadline-wrapped": fmt.Errorf("net/http: HTTP/1.x transport connection broken: %w", &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}),
+		"closed-conn":              fmt.Errorf("write: %w", net.ErrClosed),
+		"h2-conn-lost":             errors.New("http2: client connection lost"),
+		"h2-conn-lost-in-url":      &url.Error{Op: "Put", URL: "https://www.googleapis.com/upload", Err: errors.New("http2: client connection lost")},
+		"h2-header-timeout":        errors.New("http2: timeout awaiting response headers"),
+		"h2-goaway":                errors.New("http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=NO_ERROR"),
+		"conn-reset":               &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET},
+		"unexpected-eof":           fmt.Errorf("reading body: %w", io.ErrUnexpectedEOF),
+	}
+
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			out := ClassifyContext(t.Context(), in, testOp, testBlobID)
+
+			de, ok := AsDriveError(out)
+			require.True(t, ok)
+			require.Equal(t, RetryableResume, de.Disposition())
+			require.Contains(t, out.Error(), "network error")
+		})
+	}
+}
+
+// TestClassifyContextTransportTimeoutWithLiveContext covers the errors net/http
+// reports for its own timeouts that nonetheless match context.DeadlineExceeded.
+func TestClassifyContextTransportTimeoutWithLiveContext(t *testing.T) {
+	cases := map[string]error{
+		"response-header-timeout": &url.Error{Op: "Get", URL: "https://www.googleapis.com/drive/v3/files", Err: fakeHTTPTimeoutError{}},
+		"bare-deadline":           context.DeadlineExceeded,
+		"chunk-upload-wrapped":    fmt.Errorf("chunk upload failed after 2 attempts, final error: %w", &url.Error{Op: "Post", URL: "u", Err: fakeHTTPTimeoutError{}}),
+		"bare-canceled":           context.Canceled,
+	}
+
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Plain Classify cannot tell; it keeps the pass-through contract.
+			require.Equal(t, in, Classify(in, testOp, testBlobID))
+
+			out := ClassifyContext(t.Context(), in, testOp, testBlobID)
+
+			de, ok := AsDriveError(out)
+			require.True(t, ok)
+			require.Equal(t, RetryableResume, de.Disposition())
+			require.True(t, de.Disposition().Retryable())
+			require.Contains(t, out.Error(), "stalled or timed out")
+			require.Contains(t, out.Error(), testOp)
+
+			// It must not read as a cancellation to upper layers ...
+			require.NotErrorIs(t, out, context.DeadlineExceeded)
+			require.NotErrorIs(t, out, context.Canceled)
+
+			// ... while the transport error itself stays reachable.
+			var ne net.Error
+
+			require.ErrorAs(t, out, &ne)
+			require.True(t, ne.Timeout())
+
+			var inURL *url.Error
+			if errors.As(in, &inURL) {
+				var ue *url.Error
+
+				require.ErrorAs(t, out, &ue)
+			}
+
+			// Idempotent.
+			require.Equal(t, out, ClassifyContext(t.Context(), out, testOp, testBlobID))
+		})
+	}
+}
+
+func TestClassifyContextCallerCancellationPassesThrough(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	expired, cancelExpired := context.WithDeadline(t.Context(), clock.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	cases := map[string]struct {
+		ctx context.Context //nolint:containedctx
+		in  error
+	}{
+		"canceled":                {ctx, context.Canceled},
+		"canceled-in-url":         {ctx, &url.Error{Op: "Get", URL: "u", Err: context.Canceled}},
+		"deadline":                {expired, context.DeadlineExceeded},
+		"response-header-timeout": {expired, &url.Error{Op: "Get", URL: "u", Err: fakeHTTPTimeoutError{}}},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			out := ClassifyContext(tc.ctx, tc.in, testOp, testBlobID)
+
+			require.Equal(t, tc.in, out)
+
+			_, ok := AsDriveError(out)
+			require.False(t, ok)
+		})
+	}
+}
+
+func TestClassifyContextMatchesClassifyForOtherErrors(t *testing.T) {
+	for _, in := range []error{
+		gerr(http.StatusForbidden, "rateLimitExceeded", "slow down"),
+		gerr(http.StatusNotFound, "notFound", "nope"),
+		io.ErrUnexpectedEOF,
+		errors.New("something else"),
+	} {
+		require.Equal(t, Classify(in, testOp, testBlobID), ClassifyContext(t.Context(), in, testOp, testBlobID))
+	}
+
+	require.NoError(t, ClassifyContext(t.Context(), nil, testOp, testBlobID))
 }

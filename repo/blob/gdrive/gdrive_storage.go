@@ -100,6 +100,28 @@ const (
 	// with a burst of new TLS handshakes.
 	defaultDeleteParallelism = 8
 
+	// defaultHTTP2ReadIdleTimeoutSec and defaultHTTP2PingTimeoutSec are the
+	// HTTP/2 health check google.golang.org/api/transport/http configures for
+	// its own clients (31s idle, 15s ping), which this backend bypasses by
+	// supplying its own HTTP client. A connection whose peer vanished - the
+	// classic resume-from-suspend case - is detected within ~46s instead of
+	// waiting out the kernel's TCP retransmission timeout (tens of minutes).
+	defaultHTTP2ReadIdleTimeoutSec = 31
+	defaultHTTP2PingTimeoutSec     = 15
+
+	// defaultResponseHeaderTimeoutSec bounds the wait for response headers. The
+	// clock starts only once the request body is fully written, so it does not
+	// limit upload size or speed; it covers the server finalizing a resumable
+	// chunk or a file, which takes seconds. Two minutes is generous enough for a
+	// slow finalize and catches a peer that keeps the connection alive (answers
+	// HTTP/2 pings) but never answers the request.
+	defaultResponseHeaderTimeoutSec = 120
+
+	// defaultIOIdleTimeoutSec closes a connection on which nothing was read or
+	// written for this long. It matches rclone's --timeout default and is the
+	// backstop for HTTP/1.1 connections, which have no ping.
+	defaultIOIdleTimeoutSec = 300
+
 	// bytesPerMB converts the megabyte-denominated tuning knobs.
 	bytesPerMB = 1 << 20
 )
@@ -275,8 +297,15 @@ var log = logging.Module("gdrive")
 var testDriveTransports sync.Map // map[string]testDriveTransport
 
 type testDriveTransport struct {
+	// base replaces the OAuth-authenticated transport. nil selects the
+	// production transport (newHTTPTransport) without authentication, which is
+	// how tests exercise the stall timeouts against the fake server.
 	base     http.RoundTripper
 	endpoint string
+
+	// timeouts, when set, replaces the resolved transport timeouts, which the
+	// seconds-denominated tuning knobs cannot make small enough for a test.
+	timeouts *transportTimeouts
 }
 
 // testTransportKey is the key a test registers its fake Drive under: the folder
@@ -300,6 +329,7 @@ type resolvedTuning struct {
 	deleteParallelism  int
 	useBatchDelete     bool
 	cacheDir           string
+	timeouts           transportTimeouts
 }
 
 type gdriveStorage struct {
@@ -370,7 +400,7 @@ func New(ctx context.Context, opt *Options, isCreate bool) (blob.Storage, error)
 	tuning := resolveTuning(opt)
 	stats := NewTransportStats()
 
-	service, httpClient, err := newDriveService(ctx, opt, stats)
+	service, httpClient, err := newDriveService(ctx, opt, tuning.timeouts, stats)
 	if err != nil {
 		return nil, err
 	}
@@ -659,13 +689,30 @@ func resolveTuning(opt *Options) resolvedTuning {
 		useBatchDelete: t.UseBatchDelete != nil && *t.UseBatchDelete,
 
 		cacheDir: t.CacheDir,
+
+		timeouts: transportTimeouts{
+			http2ReadIdle:  secondsOrDefault(t.HTTP2ReadIdleTimeoutSec, defaultHTTP2ReadIdleTimeoutSec),
+			http2Ping:      secondsOrDefault(t.HTTP2PingTimeoutSec, defaultHTTP2PingTimeoutSec),
+			responseHeader: secondsOrDefault(t.ResponseHeaderTimeoutSec, defaultResponseHeaderTimeoutSec),
+			ioIdle:         secondsOrDefault(t.IOIdleTimeoutSec, defaultIOIdleTimeoutSec),
+		},
 	}
 
 	if res.cacheDir == "" {
 		res.cacheDir = defaultCacheDir()
 	}
 
+	if v, ok := testDriveTransports.Load(testTransportKey(opt)); ok {
+		if t, _ := v.(testDriveTransport); t.timeouts != nil {
+			res.timeouts = *t.timeouts
+		}
+	}
+
 	return res
+}
+
+func secondsOrDefault(v, def int) time.Duration {
+	return time.Duration(valueOrDefault(v, def)) * time.Second
 }
 
 func valueOrDefault(v, def int) int {
@@ -698,16 +745,16 @@ func defaultCacheDir() string {
 
 // newDriveService builds the Drive client stack:
 //
-//	token source (gdrive_auth.go)
-//	  -> oauth2.Transport            (adds Authorization)
+//	newHTTPTransport                 (stall timeouts, HTTP/2 health checks)
+//	  -> oauth2.Transport            (adds Authorization; token source from gdrive_auth.go)
 //	    -> instrumentedTransport     (counts calls, bytes, latency, statuses)
 //	      -> drive.Service
 //
 // The instrumentation sits OUTSIDE the OAuth transport on purpose, so that a
 // token-refresh round trip is attributed like any other call and the byte
 // counters see exactly what went on the wire.
-func newDriveService(ctx context.Context, opt *Options, stats *TransportStats) (*drive.Service, *http.Client, error) {
-	base, endpoint, err := newBaseTransport(ctx, opt)
+func newDriveService(ctx context.Context, opt *Options, timeouts transportTimeouts, stats *TransportStats) (*drive.Service, *http.Client, error) {
+	base, endpoint, err := newBaseTransport(ctx, opt, timeouts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -733,9 +780,12 @@ func newDriveService(ctx context.Context, opt *Options, stats *TransportStats) (
 	return service, httpClient, nil
 }
 
-func newBaseTransport(ctx context.Context, opt *Options) (http.RoundTripper, string, error) {
+func newBaseTransport(ctx context.Context, opt *Options, timeouts transportTimeouts) (http.RoundTripper, string, error) {
 	if v, ok := testDriveTransports.Load(testTransportKey(opt)); ok {
 		t, _ := v.(testDriveTransport)
+		if t.base == nil {
+			return newHTTPTransport(timeouts), t.endpoint, nil
+		}
 
 		return t.base, t.endpoint, nil
 	}
@@ -755,7 +805,7 @@ func newBaseTransport(ctx context.Context, opt *Options) (http.RoundTripper, str
 	// Same shape as oauth2.NewClient, but built explicitly so the transport can
 	// be wrapped afterwards.
 	return &oauth2.Transport{
-		Base:   http.DefaultTransport,
+		Base:   newHTTPTransport(timeouts),
 		Source: oauth2.ReuseTokenSource(nil, ts),
 	}, "", nil
 }
@@ -765,7 +815,7 @@ func newBaseTransport(ctx context.Context, opt *Options) (http.RoundTripper, str
 // Exported for tests and tooling that need to manage the repository folder
 // itself (which is not a blob and therefore not reachable through blob.Storage).
 func CreateDriveService(ctx context.Context, opt *Options) (*drive.Service, error) {
-	service, _, err := newDriveService(ctx, opt, NewTransportStats())
+	service, _, err := newDriveService(ctx, opt, resolveTuning(opt).timeouts, NewTransportStats())
 
 	return service, err
 }
@@ -2152,6 +2202,14 @@ func escapeQueryLiteral(v string) string {
 // boundary: googleapi's chunk loop selects on ctx.Done() and returns ctx.Err(),
 // which gdriveerr passes through untouched, and the abandoned resumable session
 // expires on Drive's side (one week) without holding any quota.
+//
+// A chunk that fails with a network error (including a stall timeout) is
+// re-sent by googleapi on the SAME session at the same offset, so only that
+// chunk is repeated - but only while the chunk's retry deadline has not passed,
+// and googleapi measures that deadline from the chunk's first attempt. Its
+// default (32s) is shorter than every stall timeout, which would turn each
+// stall into a pacer-level retry that starts a brand-new session and re-sends
+// the whole blob; see transportTimeouts.chunkRetryDeadline.
 func (s *gdriveStorage) mediaOptions(length int) []googleapi.MediaOption {
 	chunkSize := 0
 	if int64(length) >= s.tuning.simpleUploadCutoff {
@@ -2161,6 +2219,7 @@ func (s *gdriveStorage) mediaOptions(length int) []googleapi.MediaOption {
 	return []googleapi.MediaOption{
 		googleapi.ChunkSize(chunkSize),
 		googleapi.ContentType(uploadContentType),
+		googleapi.ChunkRetryDeadline(s.tuning.timeouts.chunkRetryDeadline()),
 	}
 }
 

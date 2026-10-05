@@ -76,6 +76,31 @@ type fakeDrive struct {
 
 	// userAgent is the User-Agent of the most recent request.
 	userAgent string
+
+	// stalls holds one-shot stall injections; see stallNext.
+	stalls []fakeStall
+
+	// stallRelease is closed at test cleanup to unblock stalled handlers whose
+	// client never closed the connection.
+	stallRelease chan struct{}
+
+	// resumableSessions counts resumable sessions started; resumableChunkBytes
+	// sums the body bytes of every resumable chunk request the fake accepted.
+	resumableSessions   int
+	resumableChunkBytes int64
+
+	// productionTransport and transportTimeouts are applied by registerTransport;
+	// see useProductionTransport.
+	productionTransport bool
+	transportTimeouts   *transportTimeouts
+}
+
+// fakeStall makes a matching request hang: the handler reads bodyBytes of the
+// request body and then neither reads further nor responds until the client
+// gives up on the request.
+type fakeStall struct {
+	match     func(r *http.Request) bool
+	bodyBytes int64
 }
 
 type fakeFile struct {
@@ -133,6 +158,7 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 		requests:     map[string]int{},
 		inFlight:     map[string]int{},
 		peakInFlight: map[string]int{},
+		stallRelease: make(chan struct{}),
 	}
 
 	// My Drive itself, under the alias Drive accepts wherever a folder ID is
@@ -157,7 +183,51 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 	d.server = httptest.NewServer(d)
 	t.Cleanup(d.server.Close)
 
+	// Registered after the server, so it runs before server.Close, which would
+	// otherwise wait forever for a stalled handler.
+	t.Cleanup(func() { close(d.stallRelease) })
+
 	return d
+}
+
+// useProductionTransport makes storages opened against this fake use the
+// production HTTP transport (stall timeouts and all, minus authentication)
+// instead of the httptest client, with the given timeouts. It must be called
+// before options().
+func (d *fakeDrive) useProductionTransport(timeouts transportTimeouts) {
+	d.productionTransport = true
+	d.transportTimeouts = &timeouts
+}
+
+// stallNext makes the next request for which match returns true hang without
+// a response; see fakeStall. match is called under the fake's lock.
+func (d *fakeDrive) stallNext(match func(r *http.Request) bool, bodyBytes int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.stalls = append(d.stalls, fakeStall{match: match, bodyBytes: bodyBytes})
+}
+
+// stall implements one injected stall. It aborts the connection when the
+// client has gone, so nothing is ever sent back.
+func (d *fakeDrive) stall(r *http.Request, st fakeStall) {
+	if st.bodyBytes > 0 {
+		io.CopyN(io.Discard, r.Body, st.bodyBytes) //nolint:errcheck
+	}
+
+	select {
+	case <-r.Context().Done():
+	case <-d.stallRelease:
+	}
+
+	panic(http.ErrAbortHandler)
+}
+
+func (d *fakeDrive) resumableStats() (sessions int, chunkBytes int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.resumableSessions, d.resumableChunkBytes
 }
 
 // options returns Options pointing at this fake Drive and registers the
@@ -194,10 +264,17 @@ func (d *fakeDrive) optionsForFolderName(t *testing.T, cacheDir, folderName stri
 func (d *fakeDrive) registerTransport(t *testing.T, key string) {
 	t.Helper()
 
-	testDriveTransports.Store(key, testDriveTransport{
+	tr := testDriveTransport{
 		base:     d.server.Client().Transport,
 		endpoint: d.server.URL + "/drive/v3/",
-	})
+	}
+
+	if d.productionTransport {
+		tr.base = nil
+		tr.timeouts = d.transportTimeouts
+	}
+
+	testDriveTransports.Store(key, tr)
 
 	t.Cleanup(func() { testDriveTransports.Delete(key) })
 }
@@ -344,6 +421,20 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.inFlight[method]--
 		d.mu.Unlock()
 	}()
+
+	for i := range d.stalls {
+		if !d.stalls[i].match(r) {
+			continue
+		}
+
+		st := d.stalls[i]
+		d.stalls = slices.Delete(d.stalls, i, i+1)
+		d.mu.Unlock()
+
+		d.stall(r, st) // aborts the handler; never returns
+
+		return
+	}
 
 	var hook func()
 
@@ -943,6 +1034,7 @@ func (d *fakeDrive) handleResumableStart(w http.ResponseWriter, r *http.Request,
 	d.mu.Lock()
 
 	d.seq++
+	d.resumableSessions++
 	sessionID := fmt.Sprintf("session-%04d", d.seq)
 	d.sessions[sessionID] = &fakeSession{
 		fileID:   fileID,
@@ -972,7 +1064,7 @@ func (d *fakeDrive) handleResumableChunk(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	final, err := parseContentRange(r.Header.Get("Content-Range"))
+	start, final, err := parseContentRange(r.Header.Get("Content-Range"))
 	if err != nil {
 		writeDriveError(w, http.StatusBadRequest, "badRequest", err.Error())
 		return
@@ -987,7 +1079,20 @@ func (d *fakeDrive) handleResumableChunk(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	s.buf = append(s.buf, body...)
+	// A chunk is placed at the offset the client names, the way Drive does, so
+	// a re-sent chunk replaces bytes instead of duplicating them. Only an
+	// offset beyond what the session holds is a client bug.
+	if start < 0 {
+		start = int64(len(s.buf))
+	}
+
+	if start > int64(len(s.buf)) {
+		writeDriveError(w, http.StatusBadRequest, "badRequest", fmt.Sprintf("chunk starts at %v but the session holds %v bytes", start, len(s.buf)))
+		return
+	}
+
+	d.resumableChunkBytes += int64(len(body))
+	s.buf = append(s.buf[:start], body...)
 
 	if !final {
 		// Drive replies 200 + X-Http-Status-Code-Override: 308 when the client
@@ -1010,21 +1115,36 @@ func (d *fakeDrive) handleResumableChunk(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, applyMask(fileResource(f), s.fields))
 }
 
-// parseContentRange reports whether the chunk is the last one. The Go client
+// parseContentRange returns the chunk's starting offset (-1 for an empty final
+// chunk, which has none) and whether the chunk is the last one. The Go client
 // emits "bytes a-b/*" while more is coming and "bytes a-b/total" (or
 // "bytes */total") for the final chunk.
-func parseContentRange(v string) (final bool, err error) {
+func parseContentRange(v string) (start int64, final bool, err error) {
 	spec, ok := strings.CutPrefix(v, "bytes ")
 	if !ok {
-		return false, errors.Errorf("unsupported Content-Range %q", v)
+		return 0, false, errors.Errorf("unsupported Content-Range %q", v)
 	}
 
-	_, total, ok := strings.Cut(spec, "/")
+	rng, total, ok := strings.Cut(spec, "/")
 	if !ok {
-		return false, errors.Errorf("unsupported Content-Range %q", v)
+		return 0, false, errors.Errorf("unsupported Content-Range %q", v)
 	}
 
-	return total != "*", nil
+	if rng == "*" {
+		return -1, total != "*", nil
+	}
+
+	first, _, ok := strings.Cut(rng, "-")
+	if !ok {
+		return 0, false, errors.Errorf("unsupported Content-Range %q", v)
+	}
+
+	start, err = strconv.ParseInt(first, 10, 64)
+	if err != nil {
+		return 0, false, errors.Wrapf(err, "unsupported Content-Range %q", v)
+	}
+
+	return start, total != "*", nil
 }
 
 // storeUploadLocked creates or replaces the file behind an upload.

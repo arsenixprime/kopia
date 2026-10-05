@@ -53,6 +53,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
@@ -706,6 +707,79 @@ func Classify(err error, op, blobID string) error {
 	}
 }
 
+// ClassifyContext is Classify for a request made under ctx, which is what lets
+// it tell the caller's cancellation from a timeout inside the HTTP stack.
+//
+// Classify alone cannot: Go's transport reports several of its own timeouts -
+// ResponseHeaderTimeout ("net/http: timeout awaiting response headers") and a
+// dialer timeout ("i/o timeout" from package net) - as errors for which
+// errors.Is(err, context.DeadlineExceeded) is true, exactly like an expired
+// caller context. The caller's context is the only authority on that question:
+//
+//   - ctx done: err is returned unchanged, as Classify does, and is never
+//     retried.
+//   - ctx still live: the context-like error came from below the caller (a
+//     stalled or dead connection after a suspend, a network change, ...), and
+//     it is classified RetryableResume like any other network failure. The
+//     result deliberately does NOT satisfy errors.Is(_, context.Canceled) or
+//     errors.Is(_, context.DeadlineExceeded): if the retries run out, the error
+//     that reaches Kopia must read as a failure, not as a cancellation the user
+//     never asked for.
+func ClassifyContext(ctx context.Context, err error, op, blobID string) error {
+	if err == nil {
+		return nil
+	}
+
+	if ctx.Err() != nil || !isContextError(err) {
+		return Classify(err, op, blobID)
+	}
+
+	if _, already := AsDriveError(err); already {
+		return err
+	}
+
+	return &DriveError{
+		op:          op,
+		blobID:      blobID,
+		disposition: RetryableResume,
+		summary:     "connection to Google Drive stalled or timed out",
+		remediation: "transient; retrying on a fresh connection (safe to resume an in-flight resumable upload).",
+		cause:       transportTimeoutError{err},
+	}
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// transportTimeoutError carries a transport timeout that claims to be a
+// context error (see ClassifyContext) while hiding exactly that claim. It has
+// no Unwrap on purpose, since errors.Is would otherwise walk past Is into the
+// wrapped error; Is and As delegate everything else.
+type transportTimeoutError struct {
+	err error
+}
+
+func (e transportTimeoutError) Error() string { return e.err.Error() }
+
+// Timeout reports true: this is, by construction, a timeout.
+func (e transportTimeoutError) Timeout() bool { return true }
+
+// Temporary reports true; it is part of net.Error.
+func (e transportTimeoutError) Temporary() bool { return true }
+
+func (e transportTimeoutError) Is(target error) bool {
+	if target == context.Canceled || target == context.DeadlineExceeded {
+		return false
+	}
+
+	return errors.Is(e.err, target)
+}
+
+func (e transportTimeoutError) As(target any) bool {
+	return errors.As(e.err, target)
+}
+
 func fromGoogleAPIError(orig error, ae *googleapi.Error, op, blobID string) error {
 	infoReason, activationURL, consumer := errorInfoFrom(ae.Details)
 
@@ -973,6 +1047,21 @@ func parseRetryAfter(h http.Header) time.Duration {
 	return 0
 }
 
+// transportErrorMessages are failures the HTTP/2 client reports as plain
+// errors.New values - no type to match, and not always wrapped in a *url.Error
+// (a response body read returns them bare) - so they can only be recognized by
+// their text. All of them mean the connection died under the request.
+//
+//nolint:gochecknoglobals
+var transportErrorMessages = []string{
+	"http2: client connection lost",
+	"http2: client connection force closed",
+	"http2: server sent GOAWAY and closed the connection",
+	"http2: timeout awaiting response headers",
+	"net/http: timeout awaiting response headers",
+	"use of closed network connection",
+}
+
 // isNetworkRetryable reports whether err is a transport-level failure that is
 // worth another attempt.
 func isNetworkRetryable(err error) bool {
@@ -982,6 +1071,12 @@ func isNetworkRetryable(err error) bool {
 	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNABORTED),
 		errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, syscall.EPIPE),
 		errors.Is(err, syscall.ETIMEDOUT), errors.Is(err, syscall.EHOSTUNREACH):
+		return true
+	case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, net.ErrClosed):
+		// The backend's per-connection idle deadline firing, and the transport
+		// closing the connection it fired on.
+		return true
+	case hasTransportErrorMessage(err):
 		return true
 	}
 
@@ -1000,6 +1095,18 @@ func isNetworkRetryable(err error) bool {
 	default:
 		return false
 	}
+}
+
+func hasTransportErrorMessage(err error) bool {
+	msg := err.Error()
+
+	for _, m := range transportErrorMessages {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // AsDriveError recovers the *DriveError from an error chain.

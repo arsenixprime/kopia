@@ -82,6 +82,10 @@ func TestGDriveTuningFlagsAll(t *testing.T) {
 		"--delete-parallelism", "80",
 		"--use-batch-delete", "true",
 		"--tuning-cache-dir", "/some/cache/dir",
+		"--http2-read-idle-timeout-sec", "90",
+		"--http2-ping-timeout-sec", "100",
+		"--response-header-timeout-sec", "110",
+		"--io-idle-timeout-sec", "120",
 	)
 
 	require.Equal(t, gdrive.TuningOptions{
@@ -95,6 +99,11 @@ func TestGDriveTuningFlagsAll(t *testing.T) {
 		DeleteParallelism:    80,
 		UseBatchDelete:       new(true),
 		CacheDir:             "/some/cache/dir",
+
+		HTTP2ReadIdleTimeoutSec:  90,
+		HTTP2PingTimeoutSec:      100,
+		ResponseHeaderTimeoutSec: 110,
+		IOIdleTimeoutSec:         120,
 	}, c.options.Tuning)
 }
 
