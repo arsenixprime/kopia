@@ -169,6 +169,27 @@ reviews RECON.md against the gate checklist.
   b1da5999; byte-identical to work branch for upstream paths (diff=0);
   build/test/lint verified on the branch itself. User's trial binaries
   (4b2ad623+) need no rebuild — no behavior change in this sync.
+- **Stall detection 2026-10-05** (field bug: lappy3 suspended
+  mid-seed, process alive but idle after wake). Root cause: no stall
+  detection; our custom http.Client (also the old upstream backend's)
+  bypasses google api transport's HTTP/2 ReadIdleTimeout that GCS gets.
+  Kopia-wide gap too (Azure/WebDAV/B2 none, S3 header-only), drafted as
+  separate upstream issue in UPSTREAM_ISSUE_TIMEOUTS.md. Opus agent
+  fix, 37caf6d1: HTTP/2 SendPingTimeout 31s/PingTimeout 15s,
+  ResponseHeaderTimeout 2m, 5m I/O idle deadline under TLS; four tuning
+  knobs + flags. Found and fixed two latent bugs on the way: (a) Go
+  reports transport timeouts as context.DeadlineExceeded, which the
+  pacer treated as caller cancellation, so connect/header timeouts
+  were never retried (new gdriveerr.ClassifyContext consults caller
+  ctx); (b) googleapi's 32s per-chunk retry deadline was shorter than
+  any stall detection, so every stall restarted the blob on a new
+  session (now 2x slowest detection bound = 10m). EM review: transport
+  and classifier read in full; Classify pass-through paths verified
+  equivalent; lint 0, all tests + race pass; live suite 4/4 by EM, 10/11
+  total (one earlier ValidateProvider failure by agent, error not
+  captured, not reproduced). Upstream branch rebuilt d26b03e1 and
+  pushed; installer release v0.2.0 (build 360ab953). Still open: roaming
+  wifi gate is start-time only (watcher proposed, not built).
 - **Public installer repo 2026-10-04** —
   github.com/arsenixprime/kopia-gdrive-setup: standalone installer
   (script + README + CLAUDE.md only; binaries from build 96cb022d as
