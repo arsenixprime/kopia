@@ -59,6 +59,8 @@ Kopia performs all its operations locally on your machine, meaning that you do n
 * **Azure Blob Storage**
 * **Backblaze B2**
 * **Google Cloud Storage**
+* **Google Drive**
+  * Supported natively (Kopia CLI only) and through Rclone (see below); the two are not interchangeable, so pick one
 * Any remote server or cloud storage that supports **WebDAV**
 * Any remote server or cloud storage that supports **SFTP**
 * Some of the cloud storages supported by **Rclone**
