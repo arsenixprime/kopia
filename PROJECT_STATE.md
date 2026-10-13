@@ -169,6 +169,22 @@ reviews RECON.md against the gate checklist.
   b1da5999; byte-identical to work branch for upstream paths (diff=0);
   build/test/lint verified on the branch itself. User's trial binaries
   (4b2ad623+) need no rebuild — no behavior change in this sync.
+- **Upstream sync + rebuild 2026-10-13**: work branch pushed to fork
+  for the first time (was at 133fc64c; secret-scanned: no credentials,
+  only GCP project number + test folder IDs in fork-only docs). Merged
+  upstream/master 56ff2910 (11 dep-only commits, zero overlap): Go
+  1.27.2, x/net v0.60.0, google api v0.300.0. One Go 1.27 modernize
+  finding (embedlit, fork-only bench) autofixed. Upstream branch
+  re-squashed 0c464cd9 on 56ff2910, diff=0 vs work branch, pushed.
+  Installer release v0.2.1 (build 9c555cf0, clean tree).
+  OPEN BUG (pre-existing, blocks upstream PR): live ValidateProvider
+  flakes ~2/13 runs: verifyBlobCount after PutBlob from a different
+  connection lists 0, wanted 1. ListBlobs has no Drive list-index lag
+  compensation (GetMetadata has the journal-tail path; ListBlobs does
+  not). Real backups low-risk (kopia's ownwrites wraps index prefixes),
+  but validate-provider must be reliable. Candidate fix: merge recent
+  fileID-journal writes matching the prefix into ListBlobs results,
+  confirmed by files.get by ID. Not yet started.
 - **Stall detection 2026-10-05** (field bug: lappy3 suspended
   mid-seed, process alive but idle after wake). Root cause: no stall
   detection; our custom http.Client (also the old upstream backend's)
