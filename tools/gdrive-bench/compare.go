@@ -128,15 +128,13 @@ func buildSeries(files []string, results []*RunResult) []*seriesData {
 			}
 
 			s := &seriesData{
-				CompareSource: CompareSource{
-					Key:       key,
-					FileIndex: i,
-					File:      filepath.Base(files[i]), //nolint:gosec // i indexes results, which buildSeries is always called with alongside files.
-					Label:     r.Label,
-					Target:    name,
-					Commit:    r.Harness.Commit,
-				},
-				values: map[string]map[string][]float64{},
+				Key:       key,
+				FileIndex: i,
+				File:      filepath.Base(files[i]), //nolint:gosec // i indexes results, which buildSeries is always called with alongside files.
+				Label:     r.Label,
+				Target:    name,
+				Commit:    r.Harness.Commit,
+				values:    map[string]map[string][]float64{},
 			}
 
 			for _, tr := range r.Trials {
