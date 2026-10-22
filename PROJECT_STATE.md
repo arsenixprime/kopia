@@ -151,6 +151,20 @@ reviews RECON.md against the gate checklist.
 - LOCAL_TESTING.md rewritten rclone-free (per-machine repo layout
   recommended for client machines; cross-user drive.file sharing
   explicitly steered away from pending live testing).
+- **Upstream sync 2026-10-22**: merged upstream/master 08350057 into
+  gdrive-native-v2 (14 commits since 56ff2910, zero overlap with our
+  files — only repo/blob changes are FS-provider rename-retry +
+  sharded tests): Go 1.27.3, dep bumps (go-fuse 2.12, prometheus
+  common), htmlui upgrade, secure server cookies, CLI upgrade-lock and
+  index-validation error fixes. Build + gdrive/bench tests (-race)
+  green, lint (gdrive+bench+cli) exit 0, no new findings. Merge commit
+  895b6c9b. Upstream branch re-squashed 53365ea8 on 08350057 (reused
+  0c464cd9 message), diff=0 vs work branch, builds; both branches
+  pushed. Installer release v0.2.2 (build 895b6c9b). PROJECT STATUS
+  CHANGE (user decision 2026-10-22): upstream has not expressed
+  interest in the backend, so the fork is self-maintained for now;
+  periodic upstream syncs continue, upstream PR submission on hold.
+  List-lag ValidateProvider flake (2026-10-13 entry) still open.
 - **Upstream sync 2026-10-03** (user-requested check): merged
   upstream/master b1da5999 into gdrive-native-v2 (91 commits since fork
   point 133fc64c, ZERO file overlap with our changes — conflict-free).
