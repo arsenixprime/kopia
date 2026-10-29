@@ -151,6 +151,23 @@ reviews RECON.md against the gate checklist.
 - LOCAL_TESTING.md rewritten rclone-free (per-machine repo layout
   recommended for client machines; cross-user drive.file sharing
   explicitly steered away from pending live testing).
+- **Desktop rollout 2026-10-29**: workspace-wide desktop backup for
+  greensightag.com users. Added per-user Windows installer
+  (setup-kopia-gdrive.ps1: Task Scheduler, %LOCALAPPDATA%, profile
+  minus AppData, 13:00 + StartWhenAvailable catch-up) and macOS
+  installer (setup-kopia-gdrive-mac.sh: launchd agents, ~/Library/
+  Application Support, $HOME minus Trash/Caches/CloudStorage/
+  Developer/Containers, guided Full Disk Access grant) to
+  kopia-gdrive-setup (commit fbf1210). Built windows-amd64 +
+  darwin-arm64 + darwin-amd64 binaries from 895b6c9b; release v0.3.0
+  with all five binaries + the three setup scripts as assets (the
+  Win/Mac one-liners fetch scripts from releases/latest/download/).
+  End-user wiki page drafted (Claude doc, placeholders for IT
+  contact/client.json link/escrow). Rollout decisions (user
+  2026-10-29): per-user own-Drive destination; native binary on all
+  three OSes; one shared org OAuth client — consent screen should be
+  switched to Internal (kills 7-day Testing expiry + unverified
+  warning); user-chosen repo password with IT escrow.
 - **Upstream sync 2026-10-22**: merged upstream/master 08350057 into
   gdrive-native-v2 (14 commits since 56ff2910, zero overlap with our
   files — only repo/blob changes are FS-provider rename-retry +
