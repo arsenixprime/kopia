@@ -16,6 +16,18 @@ Kopia
 > 2. _[lance, spear](https://en.wikipedia.org/wiki/Kopia)_
 > 3. _[fast and secure backup tool](https://kopia.io)_
 
+About This Fork
+---
+
+This is a fork of [kopia/kopia](https://github.com/kopia/kopia) adding a
+ground-up rewrite of the **native Google Drive backend** (the upstream one
+is unmaintained): structured error handling, adaptive rate limiting, a
+persistent cross-process file-ID cache, `drive.file` OAuth scope, and
+2–5× the throughput of the kopia+rclone/WebDAV route. See
+[FORK_NOTES.md](FORK_NOTES.md) for the background, what's added, and
+benchmarks. Everything else is unmodified upstream kopia, periodically
+synced. Prebuilt binaries and turnkey installers:
+[kopia-gdrive-setup](https://github.com/arsenixprime/kopia-gdrive-setup).
 
 Kopia is a fast and secure open-source backup/restore tool that allows you to create [encrypted](https://kopia.io/docs/features/#user-controlled-end-to-end-encryption) snapshots of your data and save the snapshots to [remote or cloud storage](https://kopia.io/docs/features/#save-snapshots-to-cloud-network-or-local-storage) of your choice, [to network-attached storage or server](https://kopia.io/docs/features/#save-snapshots-to-cloud-network-or-local-storage), or [locally on your machine](https://kopia.io/docs/features/#save-snapshots-to-cloud-network-or-local-storage). Kopia does not 'image' your whole machine. Rather, Kopia allows you to backup/restore any and all files/directories that you deem are important or critical.
 
